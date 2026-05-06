@@ -26,7 +26,7 @@ const App: React.FC = () => {
   const [findings, setFindings] = useState<any[]>([]);
   const [reviewStatus, setReviewStatus] = useState<any>(null);
   const [tests, setTests] = useState<any>(null);
-  const [testOutput, setTestOutput] = useState('');
+  const [testOutput, setTestOutput] = useState<any>(null);
   const [visualResult, setVisualResult] = useState<any>(null);
   const [pipelineStatus, setPipelineStatus] = useState<any>({ stage: 'idle', progress: 0, message: 'Ready' });
   const [connectionResult, setConnectionResult] = useState<any>(null);
@@ -58,9 +58,22 @@ const App: React.FC = () => {
           break;
         case 'testsGenerated':
           setTests(msg.data);
+          setTestOutput(null);
           break;
         case 'testOutput':
           setTestOutput(msg.data);
+          break;
+        case 'operationError':
+          setTestOutput({
+            status: 'error',
+            command: msg.data?.command || '',
+            cwd: '',
+            exitCode: null,
+            output: msg.data?.message || 'Operation failed.',
+            framework: tests?.framework || '',
+            testFilePath: tests?.filePath || '',
+            failureReason: msg.data?.message || 'Operation failed.',
+          });
           break;
         case 'visualResult':
           setVisualResult(msg.data);

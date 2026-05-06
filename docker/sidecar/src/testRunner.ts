@@ -2,66 +2,122 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 
 const execAsync = promisify(exec);
-const TEST_RUNNER_URL = process.env.TEST_RUNNER_URL || 'http://test-runner:5000';
 
 export async function runTests(
   filePath: string,
   fileContent: string,
-  framework: string
-): Promise<{ output: string; exitCode: number }> {
+  framework: string,
+  workspaceRoot?: string,
+  testConfigPath?: string
+): Promise<{
+  status: 'passed' | 'failed' | 'skipped' | 'error';
+  command: string;
+  cwd: string;
+  exitCode: number | null;
+  output: string;
+  framework: string;
+  testFilePath: string;
+  failureReason?: string;
+}> {
   console.log(`Running tests: framework=${framework}, file=${filePath}`);
 
-  // Write the test content to a temporary file
-  const tmpDir = path.join(os.tmpdir(), 'automated-qa-tests');
-  if (!fs.existsSync(tmpDir)) {
-    fs.mkdirSync(tmpDir, { recursive: true });
+  const mountedRoot = '/app/workspace';
+  const cwd = fs.existsSync(mountedRoot) ? mountedRoot : (workspaceRoot || path.dirname(filePath));
+  const mappedTestPath = mapIntoWorkspace(filePath, workspaceRoot || '', mountedRoot);
+
+  if (!mappedTestPath || !fs.existsSync(mappedTestPath)) {
+    return {
+      status: 'skipped',
+      command: '',
+      cwd,
+      exitCode: null,
+      output: '',
+      framework,
+      testFilePath: filePath,
+      failureReason:
+        'The sidecar cannot see this workspace path. Run tests from the VS Code extension host or mount the workspace into /app/workspace.',
+    };
   }
 
-  const basename = path.basename(filePath);
-  const tmpFile = path.join(tmpDir, basename);
-  fs.writeFileSync(tmpFile, fileContent, 'utf-8');
+  const relativeTestPath = quote(toPosix(path.relative(cwd, mappedTestPath) || mappedTestPath));
+  const configArg = testConfigPath && !testConfigPath.includes('#')
+    ? ` --config ${quote(toPosix(testConfigPath))}`
+    : '';
 
-  // Also copy the original source file if referenced in imports
-  const sourceDir = path.dirname(filePath);
-  const workspaceRoot = '/app/workspace';
-  const relativeSourceDir = sourceDir.replace(/^[A-Z]:\\/i, '').replace(/\\/g, '/');
-
-  // Build the test command
   const commands: Record<string, string> = {
-    jest: `npx jest "${tmpFile}" --no-cache --verbose --forceExit 2>&1`,
-    vitest: `npx vitest run "${tmpFile}" 2>&1`,
-    pytest: `python -m pytest "${tmpFile}" -v 2>&1`,
+    jest: `npx --no-install jest --runTestsByPath ${relativeTestPath}${configArg} --verbose 2>&1`,
+    vitest: `npx --no-install vitest run ${relativeTestPath}${configArg} 2>&1`,
+    pytest: `python -m pytest ${relativeTestPath} -v 2>&1`,
   };
 
-  const cmd = commands[framework] || commands.jest;
+  const cmd = commands[framework];
+  if (!cmd) {
+    return {
+      status: 'skipped',
+      command: '',
+      cwd,
+      exitCode: null,
+      output: '',
+      framework,
+      testFilePath: filePath,
+      failureReason: 'No supported test framework was detected. Expected jest, vitest, or pytest.',
+    };
+  }
 
   try {
     const { stdout, stderr } = await execAsync(cmd, {
       timeout: 120000, // 2 min timeout
-      cwd: tmpDir,
-      env: {
-        ...process.env,
-        NODE_PATH: path.join(workspaceRoot, 'node_modules'),
-      },
+      cwd,
+      maxBuffer: 1024 * 1024 * 10,
     });
 
     const output = stdout + (stderr ? `\n${stderr}` : '');
     console.log(`Tests completed successfully`);
 
-    // Cleanup
-    try { fs.unlinkSync(tmpFile); } catch {}
-
-    return { output, exitCode: 0 };
+    return { status: 'passed', command: cmd, cwd, exitCode: 0, output, framework, testFilePath: filePath };
   } catch (err: any) {
-    const output = err.stdout || '' + (err.stderr ? `\n${err.stderr}` : '') + (err.message || '');
+    const output = `${err.stdout || ''}${err.stderr ? `\n${err.stderr}` : ''}`.trim() || err.message || '';
     console.log(`Tests completed with exit code: ${err.code || 1}`);
 
-    // Cleanup
-    try { fs.unlinkSync(tmpFile); } catch {}
-
-    return { output, exitCode: err.code || 1 };
+    return {
+      status: 'failed',
+      command: cmd,
+      cwd,
+      exitCode: err.code || 1,
+      output,
+      framework,
+      testFilePath: filePath,
+      failureReason: `The test command exited with code ${err.code || 1}.`,
+    };
   }
+}
+
+function mapIntoWorkspace(filePath: string, workspaceRoot: string, mountedRoot: string): string {
+  if (!workspaceRoot) {
+    return path.join(mountedRoot, path.basename(filePath));
+  }
+
+  const normalizedFile = normalizeExternalPath(filePath);
+  const normalizedRoot = normalizeExternalPath(workspaceRoot);
+  const relative = path.posix.relative(normalizedRoot, normalizedFile);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    return '';
+  }
+  return path.join(mountedRoot, relative);
+}
+
+function normalizeExternalPath(value: string): string {
+  return value
+    .replace(/\\/g, '/')
+    .replace(/^([A-Za-z]):/, (_match, drive) => `/${drive.toLowerCase()}`);
+}
+
+function quote(value: string): string {
+  return `"${value.replace(/"/g, '\\"')}"`;
+}
+
+function toPosix(value: string): string {
+  return value.replace(/\\/g, '/');
 }

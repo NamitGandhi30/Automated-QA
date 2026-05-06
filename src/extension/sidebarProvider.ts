@@ -62,7 +62,19 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
     // Listen for messages from the webview
     webviewView.webview.onDidReceiveMessage(async (message) => {
-      await this.handleMessage(message);
+      try {
+        await this.handleMessage(message);
+      } catch (err: any) {
+        const messageText = this.getErrorMessage(err);
+        this.postMessage({
+          type: 'operationError',
+          data: {
+            command: message?.command || 'unknown',
+            message: messageText,
+          },
+        });
+        vscode.window.showErrorMessage(`Automated QA: ${messageText}`);
+      }
     });
 
     // Listen for engine events
@@ -86,7 +98,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     this.testArchitect.onTestsGenerated((tests) => {
       this.postMessage({ type: 'testsGenerated', data: {
         filePath: tests.filePath,
+        sourceFilePath: tests.sourceFilePath,
         framework: tests.framework,
+        workspaceRoot: tests.workspaceRoot,
+        testConfigPath: tests.testConfigPath,
         normal: tests.normal,
         edgeCase: tests.edgeCase,
         stress: tests.stress,
@@ -121,7 +136,55 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private postMessage(message: any): void {
-    this._view?.webview.postMessage(message);
+    this._view?.webview.postMessage(this.toWebviewSafe(message));
+  }
+
+  private toWebviewSafe(value: any, seen = new WeakSet<object>()): any {
+    if (value === null || value === undefined) {
+      return value;
+    }
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      return value;
+    }
+    if (typeof value === 'bigint') {
+      return value.toString();
+    }
+    if (value instanceof Error) {
+      return {
+        name: value.name,
+        message: value.message,
+        stack: value.stack,
+      };
+    }
+    if (Array.isArray(value)) {
+      return value.map(item => this.toWebviewSafe(item, seen));
+    }
+    if (typeof value === 'object') {
+      if (seen.has(value)) {
+        return '[Circular]';
+      }
+      seen.add(value);
+
+      const safe: Record<string, any> = {};
+      for (const [key, child] of Object.entries(value)) {
+        if (typeof child !== 'function') {
+          safe[key] = this.toWebviewSafe(child, seen);
+        }
+      }
+      seen.delete(value);
+      return safe;
+    }
+    return String(value);
+  }
+
+  private getErrorMessage(err: any): string {
+    if (!err) {
+      return 'Unknown error';
+    }
+    if (typeof err === 'string') {
+      return err;
+    }
+    return err.message || String(err);
   }
 
   private async handleMessage(message: any): Promise<void> {
@@ -139,7 +202,20 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         break;
       case 'runTests':
         if (this.testArchitect.lastGenerated) {
-          const output = await this.testArchitect.runTests(this.testArchitect.lastGenerated.filePath);
+          const pending = this.testArchitect.lastGenerated;
+          this.postMessage({
+            type: 'testOutput',
+            data: {
+              status: 'running',
+              command: '',
+              cwd: pending.workspaceRoot,
+              exitCode: null,
+              output: '',
+              framework: pending.framework,
+              testFilePath: pending.filePath,
+            },
+          });
+          const output = await this.testArchitect.runTests(pending.filePath);
           this.postMessage({ type: 'testOutput', data: output });
         }
         break;

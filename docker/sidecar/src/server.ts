@@ -48,11 +48,11 @@ app.post('/visual-check', async (req, res) => {
 // Test runner
 app.post('/run-tests', async (req, res) => {
   try {
-    const { filePath, fileContent, framework } = req.body;
+    const { filePath, fileContent, framework, workspaceRoot, testConfigPath } = req.body;
     if (!filePath || !fileContent) {
       return res.status(400).json({ error: 'Missing filePath or fileContent' });
     }
-    const result = await runTests(filePath, fileContent, framework || 'jest');
+    const result = await runTests(filePath, fileContent, framework || 'jest', workspaceRoot, testConfigPath);
     res.json(result);
   } catch (err: any) {
     console.error('Test runner error:', err.message);

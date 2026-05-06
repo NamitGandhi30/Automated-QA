@@ -3,17 +3,40 @@ import React, { useState } from 'react';
 interface Props {
   tests: {
     filePath: string;
+    sourceFilePath?: string;
     framework: string;
+    workspaceRoot?: string;
+    testConfigPath?: string;
     normal: string;
     edgeCase: string;
     stress: string;
   } | null;
-  testOutput: string;
+  testOutput: {
+    status: 'passed' | 'failed' | 'skipped' | 'error' | 'running';
+    command: string;
+    cwd: string;
+    exitCode: number | null;
+    output: string;
+    framework: string;
+    testFilePath: string;
+    failureReason?: string;
+  } | string | null;
   postMessage: (msg: any) => void;
 }
 
 const TestPanel: React.FC<Props> = ({ tests, testOutput, postMessage }) => {
   const [openTier, setOpenTier] = useState<string | null>('normal');
+  const runResult = typeof testOutput === 'string'
+    ? (testOutput ? {
+      status: 'running' as const,
+      command: '',
+      cwd: '',
+      exitCode: null,
+      output: testOutput,
+      framework: tests?.framework || '',
+      testFilePath: tests?.filePath || '',
+    } : null)
+    : testOutput;
 
   const handleGenerate = () => {
     postMessage({ command: 'generateTests' });
@@ -58,6 +81,10 @@ const TestPanel: React.FC<Props> = ({ tests, testOutput, postMessage }) => {
             <div style={{ fontSize: '10px', opacity: 0.5, marginTop: '4px', wordBreak: 'break-all' }}>
               {tests.filePath.split(/[/\\]/).pop()}
             </div>
+            <div style={{ display: 'grid', gap: '4px', marginTop: '8px', fontSize: '10px', opacity: 0.75 }}>
+              <div><strong>Root:</strong> {tests.workspaceRoot || 'Workspace root unavailable'}</div>
+              <div><strong>Config:</strong> {tests.testConfigPath || 'Auto-detect from workspace root'}</div>
+            </div>
           </div>
 
           {tiers.map((tier) => (
@@ -77,13 +104,36 @@ const TestPanel: React.FC<Props> = ({ tests, testOutput, postMessage }) => {
         </>
       )}
 
-      {testOutput && (
+      {runResult && (
         <div style={{ marginTop: '12px' }}>
           <div style={{ fontSize: '11px', fontWeight: 600, marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '1px', opacity: 0.7 }}>
-            Test Output
+            Test Run
+          </div>
+          <div className="glass-card" style={{ padding: '8px 10px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', alignItems: 'center', marginBottom: '6px' }}>
+              <span className={`badge ${
+                runResult.status === 'passed' ? 'badge-success' :
+                runResult.status === 'failed' || runResult.status === 'error' ? 'badge-high' :
+                'badge-medium'
+              }`}>
+                {runResult.status}
+              </span>
+              <span style={{ fontSize: '10px', opacity: 0.7 }}>
+                Exit {runResult.exitCode ?? '-'}
+              </span>
+            </div>
+            {runResult.failureReason && (
+              <div style={{ fontSize: '11px', marginBottom: '6px', color: 'var(--vscode-errorForeground)' }}>
+                {runResult.failureReason}
+              </div>
+            )}
+            <div style={{ fontSize: '10px', opacity: 0.65, wordBreak: 'break-all' }}>
+              <div><strong>CWD:</strong> {runResult.cwd || '-'}</div>
+              <div><strong>Command:</strong> {runResult.command || (runResult.status === 'running' ? 'Starting...' : '-')}</div>
+            </div>
           </div>
           <div className="code-block" style={{ maxHeight: '200px', overflowY: 'auto' }}>
-            {testOutput}
+            {runResult.output || (runResult.status === 'running' ? 'Running test command...' : 'No output captured.')}
           </div>
         </div>
       )}

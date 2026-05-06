@@ -85,10 +85,19 @@ export class PRAutomator {
       // Stage 3: Run Tests
       if (tests) {
         this.updateStatus('running-tests', 50, 'Running tests (including stress tier)...');
-        const output = await this.testArchitect.runTests(tests.filePath);
-        this.outputChannel.appendLine(`Pipeline test output: ${output}`);
+        const result = await this.testArchitect.runTests(tests.filePath);
+        this.outputChannel.appendLine(`Pipeline test command: ${result.command}`);
+        this.outputChannel.appendLine(`Pipeline test output: ${result.output}`);
+        if (result.status !== 'passed') {
+          this.updateStatus(
+            'running-tests',
+            60,
+            `Tests ${result.status}: ${result.failureReason || 'See test output.'}`
+          );
+          return;
+        }
+        this.readinessTracker.markTested(filePath);
       }
-      this.readinessTracker.markTested(filePath);
 
       // Stage 4: Visual QA (optional — only if Docker is running)
       if (this.dockerManager.isStackRunning) {
