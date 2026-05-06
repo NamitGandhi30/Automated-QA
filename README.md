@@ -78,6 +78,4 @@ docker compose up --build --abort-on-container-exit
 
 - Open issues and PRs against the `main` branch. Follow existing code style and run `npm run lint` before opening PRs.
 
-## License
-
-- Add your license here.
+Build by Namit Gandhi
