@@ -1,0 +1,10 @@
+.vscode/**
+src/**
+docker/**
+node_modules/**
+.gitignore
+webpack.config.js
+tsconfig.json
+tailwind.config.js
+postcss.config.js
+**/*.map

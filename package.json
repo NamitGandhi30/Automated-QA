@@ -1,0 +1,140 @@
+{
+  "name": "automated-qa",
+  "displayName": "Automated QA - Pre-Flight Controller",
+  "description": "One-click sidebar workflow for Code Review, Multi-Tier Testing, and UI Visual Regression",
+  "version": "0.1.0",
+  "publisher": "automated-qa",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Testing",
+    "Linters",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "automated-qa-sidebar",
+          "title": "Automated QA",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "automated-qa-sidebar": [
+        {
+          "type": "webview",
+          "id": "automated-qa.sidebarView",
+          "name": "Pre-Flight Controller"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "automated-qa.runReview",
+        "title": "Automated QA: Run Semantic Review"
+      },
+      {
+        "command": "automated-qa.generateTests",
+        "title": "Automated QA: Generate Tests"
+      },
+      {
+        "command": "automated-qa.runVisualCheck",
+        "title": "Automated QA: Run Visual QA Check"
+      },
+      {
+        "command": "automated-qa.readyForPR",
+        "title": "Automated QA: Ready for PR"
+      },
+      {
+        "command": "automated-qa.startDocker",
+        "title": "Automated QA: Start Docker Stack"
+      },
+      {
+        "command": "automated-qa.stopDocker",
+        "title": "Automated QA: Stop Docker Stack"
+      }
+    ],
+    "configuration": {
+      "title": "Automated QA",
+      "properties": {
+        "automatedqa.sidecarPort": {
+          "type": "number",
+          "default": 4777,
+          "description": "Port for the Docker sidecar API"
+        },
+        "automatedqa.aiProvider": {
+          "type": "string",
+          "default": "copilot",
+          "enum": [
+            "copilot",
+            "openai",
+            "grok",
+            "claude",
+            "gemini"
+          ],
+          "description": "AI provider for code analysis and test generation"
+        },
+        "automatedqa.gitignoreTests": {
+          "type": "boolean",
+          "default": false,
+          "description": "Add generated .qa.test.* files to .gitignore"
+        },
+        "automatedqa.telemetry": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable anonymous telemetry for prompt improvement"
+        }
+      }
+    },
+    "taskDefinitions": [
+      {
+        "type": "automated-qa",
+        "required": [],
+        "properties": {
+          "task": {
+            "type": "string",
+            "description": "The task to run (e.g. omnicheck)"
+          }
+        }
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "webpack --mode production",
+    "watch": "webpack --mode development --watch",
+    "dev": "webpack --mode development --watch",
+    "package": "vsce package",
+    "lint": "eslint src --ext .ts,.tsx"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "@types/react": "^18.2.70",
+    "@types/react-dom": "^18.2.25",
+    "@types/vscode": "^1.90.0",
+    "autoprefixer": "^10.4.19",
+    "copy-webpack-plugin": "^12.0.2",
+    "css-loader": "^7.1.1",
+    "css-minimizer-webpack-plugin": "^7.0.0",
+    "mini-css-extract-plugin": "^2.9.0",
+    "postcss": "^8.4.38",
+    "postcss-loader": "^8.1.1",
+    "style-loader": "^4.0.0",
+    "tailwindcss": "^3.4.3",
+    "ts-loader": "^9.5.1",
+    "typescript": "^5.4.5",
+    "webpack": "^5.91.0",
+    "webpack-cli": "^5.1.4"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  }
+}

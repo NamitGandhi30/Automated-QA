@@ -1,0 +1,42 @@
+services:
+  sidecar:
+    build: ./docker/sidecar
+    ports:
+      - "${SIDE_CAR_PORT:-4777}:4777"
+    environment:
+      - PLAYWRIGHT_SERVICE_URL=http://playwright-runner:3000
+      - TEST_RUNNER_URL=http://test-runner:5000
+      - PORT=4777
+    volumes:
+      - .:/app/workspace:ro
+    networks:
+      - aq-bridge
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4777/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  playwright-runner:
+    build: ./docker/playwright-runner
+    networks:
+      - aq-bridge
+    restart: unless-stopped
+
+  test-runner:
+    build: ./docker/test-runner
+    volumes:
+      - .:/app/workspace:ro
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    networks:
+      - aq-bridge
+    restart: unless-stopped
+
+networks:
+  aq-bridge:
+    driver: bridge
