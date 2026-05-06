@@ -20,8 +20,11 @@ const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<Tab>('dashboard');
   const [dockerStatus, setDockerStatus] = useState(false);
   const [provider, setProvider] = useState('copilot');
+  const [ollamaConfig, setOllamaConfig] = useState({ baseUrl: 'http://localhost:11434', model: 'llama3' });
+  const [ollamaHasKey, setOllamaHasKey] = useState(false);
   const [readiness, setReadiness] = useState({ percent: 0, files: {} as any });
   const [findings, setFindings] = useState<any[]>([]);
+  const [reviewStatus, setReviewStatus] = useState<any>(null);
   const [tests, setTests] = useState<any>(null);
   const [testOutput, setTestOutput] = useState('');
   const [visualResult, setVisualResult] = useState<any>(null);
@@ -38,11 +41,20 @@ const App: React.FC = () => {
         case 'provider':
           setProvider(msg.data);
           break;
+        case 'ollamaConfig':
+          setOllamaConfig(msg.data);
+          break;
+        case 'ollamaKeyStatus':
+          setOllamaHasKey(msg.data?.hasKey ?? false);
+          break;
         case 'readiness':
           setReadiness(msg.data);
           break;
         case 'reviewFindings':
           setFindings(msg.data);
+          break;
+        case 'reviewStatus':
+          setReviewStatus(msg.data);
           break;
         case 'testsGenerated':
           setTests(msg.data);
@@ -110,7 +122,7 @@ const App: React.FC = () => {
         />
       )}
       {activeTab === 'reviewer' && (
-        <ReviewPanel findings={findings} postMessage={postMessage} />
+        <ReviewPanel findings={findings} reviewStatus={reviewStatus} postMessage={postMessage} />
       )}
       {activeTab === 'tests' && (
         <TestPanel tests={tests} testOutput={testOutput} postMessage={postMessage} />
@@ -124,6 +136,8 @@ const App: React.FC = () => {
       {activeTab === 'settings' && (
         <SettingsPanel
           provider={provider}
+          ollamaConfig={ollamaConfig}
+          ollamaHasKey={ollamaHasKey}
           connectionResult={connectionResult}
           postMessage={postMessage}
         />

@@ -5,6 +5,7 @@ import { VisualQAEngine } from './visualQAEngine';
 import { PRReadinessTracker } from './prReadinessTracker';
 import { SecretManager } from './secretManager';
 import { DockerManager } from './dockerManager';
+import { selectBestCopilotModel } from './copilotModelSelector';
 
 export type PipelineStage = 'idle' | 'reviewing' | 'generating-tests' | 'running-tests' | 'visual-check' | 'commit-message' | 'done' | 'error';
 
@@ -122,7 +123,16 @@ export class PRAutomator {
   }
 
   private async generateCommitMessage(filePath: string, findings: any[], tests: any): Promise<string> {
-    const { provider, apiKey } = await this.secretManager.getActiveKeyIfNeeded();
+    let provider: string;
+    let apiKey: string | undefined;
+    try {
+      const result = await this.secretManager.getActiveKeyIfNeeded();
+      provider = result.provider;
+      apiKey = result.apiKey;
+    } catch (err: any) {
+      this.outputChannel.appendLine(`Provider error in commit message generation: ${err.message}`);
+      return 'chore: automated QA pre-flight check';
+    }
 
     const prompt = `Generate a semantic commit message for the following changes.
 
@@ -140,10 +150,7 @@ Return ONLY the commit message, nothing else.`;
 
     if (provider === 'copilot') {
       try {
-        const models = await vscode.lm.selectChatModels({ family: 'gpt-4o' });
-        const model = models[0];
-        if (!model) { return 'chore: automated QA pre-flight check'; }
-
+        const model = await selectBestCopilotModel();
         const messages = [vscode.LanguageModelChatMessage.User(prompt)];
         const response = await model.sendRequest(messages, {}, new vscode.CancellationTokenSource().token);
         let result = '';

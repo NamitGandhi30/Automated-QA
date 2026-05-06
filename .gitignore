@@ -2,3 +2,5 @@ node_modules/
 dist/
 *.vsix
 .env
+AGENTS.md
+PRD.md

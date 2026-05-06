@@ -9,6 +9,7 @@ import { VisualQAEngine } from './visualQAEngine';
 import { PRAutomator } from './prAutomator';
 import { PRReadinessTracker } from './prReadinessTracker';
 import { WorkspaceIndexer } from './workspaceIndexer';
+import { listAvailableModelNames } from './copilotModelSelector';
 
 export class SidebarProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
@@ -69,6 +70,19 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       this.postMessage({ type: 'reviewFindings', data: findings });
     });
 
+    this.semanticReviewer.onReviewResult((result) => {
+      this.postMessage({
+        type: 'reviewStatus',
+        data: {
+          kind: result.kind,
+          summary: result.summary,
+          reviewedFile: result.reviewedFile,
+          timestamp: result.timestamp,
+          rawOutput: result.rawOutput,
+        },
+      });
+    });
+
     this.testArchitect.onTestsGenerated((tests) => {
       this.postMessage({ type: 'testsGenerated', data: {
         filePath: tests.filePath,
@@ -94,6 +108,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       files: this.readinessTracker.getAll(),
     }});
     this.postMessage({ type: 'provider', data: this.secretManager.getActiveProvider() });
+    this.postMessage({ type: 'ollamaConfig', data: this.secretManager.getOllamaConfig() });
+    // Check if an Ollama API key is already stored and tell the UI
+    this.secretManager.hasOllamaApiKey().then(hasKey => {
+      this.postMessage({ type: 'ollamaKeyStatus', data: { hasKey } });
+    });
   }
 
   updateDockerStatus(running: boolean): void {
@@ -109,6 +128,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     switch (message.command) {
       case 'runReview':
         await this.semanticReviewer.reviewActiveFile();
+        break;
+      case 'clearReview':
+        this.semanticReviewer.clearFindings();
+        this.postMessage({ type: 'reviewFindings', data: [] });
+        this.postMessage({ type: 'reviewStatus', data: null });
         break;
       case 'generateTests':
         await this.testArchitect.generateForSelection();
@@ -139,6 +163,32 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           'aiProvider', message.provider, vscode.ConfigurationTarget.Global
         );
         this.postMessage({ type: 'provider', data: message.provider });
+        // Push updated Ollama config too so the UI stays consistent
+        this.postMessage({ type: 'ollamaConfig', data: this.secretManager.getOllamaConfig() });
+        break;
+      }
+      case 'setPinnedCopilotModel': {
+        await vscode.workspace.getConfiguration('automatedqa').update(
+          'copilotModel', message.model || '', vscode.ConfigurationTarget.Global
+        );
+        break;
+      }
+      case 'setOllamaConfig': {
+        await this.secretManager.setOllamaConfig(message.baseUrl, message.model);
+        this.postMessage({ type: 'ollamaConfig', data: { baseUrl: message.baseUrl, model: message.model } });
+        this.postMessage({ type: 'keySet', data: { provider: 'ollama', success: true } });
+        break;
+      }
+      case 'setOllamaApiKey': {
+        if (message.apiKey && message.apiKey.trim()) {
+          await this.secretManager.setOllamaApiKey(message.apiKey.trim());
+          this.postMessage({ type: 'ollamaKeyStatus', data: { hasKey: true } });
+        }
+        break;
+      }
+      case 'deleteOllamaApiKey': {
+        await this.secretManager.deleteOllamaApiKey();
+        this.postMessage({ type: 'ollamaKeyStatus', data: { hasKey: false } });
         break;
       }
       case 'setApiKey':
@@ -177,12 +227,37 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private async testAIConnection(provider: string): Promise<void> {
     try {
       if (provider === 'copilot') {
-        const models = await vscode.lm.selectChatModels({ family: 'gpt-4o' });
-        if (models.length > 0) {
-          this.postMessage({ type: 'connectionResult', data: { success: true, message: `✅ Connected to ${models[0].name}` } });
+        const allModels = await listAvailableModelNames();
+        const pinned = vscode.workspace.getConfiguration('automatedqa').get<string>('copilotModel', '').trim();
+
+        if (allModels.length > 0) {
+          const pinnedNote = pinned
+            ? `\nPinned model: "${pinned}" — will be used if available.`
+            : `\nTip: pin a model via Settings → automatedqa.copilotModel`;
+          this.postMessage({
+            type: 'connectionResult',
+            data: {
+              success: true,
+              message: `✅ ${allModels.length} model(s) available:\n${allModels.join('\n')}${pinnedNote}`,
+            },
+          });
         } else {
-          this.postMessage({ type: 'connectionResult', data: { success: false, message: 'No Copilot model found. Is GitHub Copilot installed and signed in?' } });
+          this.postMessage({
+            type: 'connectionResult',
+            data: {
+              success: false,
+              message:
+                'No Language Model Chat models available.\n' +
+                'Is GitHub Copilot installed and signed in? ' +
+                'Try reloading VS Code after signing in.',
+            },
+          });
         }
+        return;
+      }
+
+      if (provider === 'ollama') {
+        await this.testOllamaConnection();
         return;
       }
 
@@ -198,6 +273,79 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     } catch (err: any) {
       this.postMessage({ type: 'connectionResult', data: { success: false, message: err.message } });
     }
+  }
+
+  private async testOllamaConnection(): Promise<void> {
+    const cfg = this.secretManager.getOllamaConfig();
+    const tagsUrl = cfg.baseUrl.replace(/\/$/, '') + '/api/tags';
+    let urlObj: URL;
+    try {
+      urlObj = new URL(tagsUrl);
+    } catch {
+      this.postMessage({ type: 'connectionResult', data: { success: false, message: `Invalid Ollama base URL: ${cfg.baseUrl}` } });
+      return;
+    }
+
+    return new Promise((resolve) => {
+      const useHttps = urlObj.protocol === 'https:';
+      const lib = useHttps ? https : http;
+      const req = lib.get(
+        {
+          hostname: urlObj.hostname,
+          port: urlObj.port || (useHttps ? 443 : 80),
+          path: urlObj.pathname,
+          timeout: 8000,
+        },
+        (res) => {
+          let data = '';
+          res.on('data', (c: any) => (data += c));
+          res.on('end', () => {
+            if (res.statusCode && res.statusCode < 400) {
+              try {
+                const body = JSON.parse(data);
+                const models: string[] = (body.models || []).map((m: any) => m.name);
+                const modelList = models.length ? models.slice(0, 5).join(', ') : '(none yet)';
+                const configured = cfg.model;
+                const modelFound = models.some(m => m === configured || m.startsWith(configured + ':'));
+                const note = modelFound
+                  ? `Model “${configured}” is available.`
+                  : `⚠️ Model “${configured}” not found. Available: ${modelList}`;
+                this.postMessage({
+                  type: 'connectionResult',
+                  data: { success: true, message: `✅ Ollama reachable at ${cfg.baseUrl}. ${note}` },
+                });
+              } catch {
+                this.postMessage({
+                  type: 'connectionResult',
+                  data: { success: true, message: `✅ Ollama reachable at ${cfg.baseUrl} (HTTP ${res.statusCode})` },
+                });
+              }
+            } else {
+              this.postMessage({
+                type: 'connectionResult',
+                data: { success: false, message: `Ollama returned HTTP ${res.statusCode} from ${cfg.baseUrl}` },
+              });
+            }
+            resolve();
+          });
+        }
+      );
+      req.on('error', (e: any) => {
+        this.postMessage({
+          type: 'connectionResult',
+          data: { success: false, message: `Cannot reach Ollama at ${cfg.baseUrl}: ${e.message}` },
+        });
+        resolve();
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        this.postMessage({
+          type: 'connectionResult',
+          data: { success: false, message: `Connection to Ollama at ${cfg.baseUrl} timed out (8s)` },
+        });
+        resolve();
+      });
+    });
   }
 
   private testProviderDirectly(provider: string, apiKey: string): Promise<{ success: boolean; message: string }> {

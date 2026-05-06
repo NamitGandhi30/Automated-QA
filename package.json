@@ -77,9 +77,33 @@
             "openai",
             "grok",
             "claude",
-            "gemini"
+            "gemini",
+            "ollama"
+          ],
+          "enumDescriptions": [
+            "GitHub Copilot via VS Code Language Model API (no key required)",
+            "OpenAI (requires API key)",
+            "Grok by xAI (requires API key)",
+            "Claude by Anthropic (requires API key)",
+            "Gemini by Google (requires API key)",
+            "Ollama — local or cloud, no API key required"
           ],
           "description": "AI provider for code analysis and test generation"
+        },
+        "automatedqa.ollamaBaseUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Base URL for Ollama server (local or cloud). Example: http://localhost:11434 or https://your-cloud-endpoint"
+        },
+        "automatedqa.ollamaModel": {
+          "type": "string",
+          "default": "llama3",
+          "description": "Ollama model name to use. Example: llama3, mistral, codellama, qwen2.5-coder"
+        },
+        "automatedqa.copilotModel": {
+          "type": "string",
+          "default": "",
+          "description": "Pin a specific GitHub Copilot / VS Code LM model family or ID (e.g. 'gpt-4o', 'qwen', 'claude-3', 'gemini-2.0-flash'). Leave blank to use the first available model automatically."
         },
         "automatedqa.gitignoreTests": {
           "type": "boolean",

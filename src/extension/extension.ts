@@ -81,19 +81,28 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Auto-start Docker stack
+  // Auto-start Docker stack — probe first to avoid restarting a running sidecar
   try {
     const isDockerAvailable = await dockerManager.isDockerRunning();
     if (isDockerAvailable) {
-      outputChannel.appendLine('Docker detected. Starting sidecar stack...');
-      await dockerManager.startStack();
-      const healthy = await dockerManager.pollUntilReady();
-      if (healthy) {
-        outputChannel.appendLine('Sidecar stack is healthy and ready.');
+      // Check if the sidecar is already healthy from a previous VS Code session
+      outputChannel.appendLine('Docker detected. Probing sidecar health...');
+      const alreadyHealthy = await dockerManager.isSidecarHealthy();
+
+      if (alreadyHealthy) {
+        outputChannel.appendLine('Sidecar already running and healthy — skipping compose up.');
         sidebarProvider.updateDockerStatus(true);
       } else {
-        outputChannel.appendLine('Sidecar stack failed health check. Some features will be unavailable.');
-        sidebarProvider.updateDockerStatus(false);
+        outputChannel.appendLine('Sidecar not running. Starting Docker stack...');
+        await dockerManager.startStack();
+        const healthy = await dockerManager.pollUntilReady();
+        if (healthy) {
+          outputChannel.appendLine('Sidecar stack is healthy and ready.');
+          sidebarProvider.updateDockerStatus(true);
+        } else {
+          outputChannel.appendLine('Sidecar stack failed health check. Some features will be unavailable.');
+          sidebarProvider.updateDockerStatus(false);
+        }
       }
     } else {
       outputChannel.appendLine('Docker not detected. Visual QA and test runner features will be unavailable.');

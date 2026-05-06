@@ -1,9 +1,12 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as https from 'https';
+import * as http from 'http';
 import { SecretManager } from './secretManager';
 import { WorkspaceIndexer } from './workspaceIndexer';
 import { DockerManager } from './dockerManager';
+import { selectBestCopilotModel } from './copilotModelSelector';
 
 export interface GeneratedTests {
   filePath: string;
@@ -62,7 +65,18 @@ export class TestArchitect {
     }
 
     const ctx = await this.workspaceIndexer.getContext();
-    const { provider, apiKey } = await this.secretManager.getActiveKeyIfNeeded();
+
+    let provider: string;
+    let apiKey: string | undefined;
+    try {
+      const result = await this.secretManager.getActiveKeyIfNeeded();
+      provider = result.provider;
+      apiKey = result.apiKey;
+    } catch (err: any) {
+      this.outputChannel.appendLine(`Provider error: ${err.message}`);
+      vscode.window.showErrorMessage(`Automated QA — Provider Error: ${err.message}`);
+      return null;
+    }
 
     this.outputChannel.appendLine(`Generating tests for selection using ${provider}...`);
 
@@ -71,6 +85,9 @@ export class TestArchitect {
 
     if (provider === 'copilot') {
       response = await this.generateViaCopilot(prompt);
+    } else if (provider === 'ollama') {
+      const ollamaCfg = await this.secretManager.getOllamaConfigWithKey();
+      response = await this.generateViaOllama(prompt, ollamaCfg);
     } else {
       response = await this.generateViaSidecar(prompt, provider, apiKey!);
     }
@@ -156,14 +173,90 @@ Return ONLY the test file content, ready to be written to disk. No markdown wrap
 Start the file with the appropriate import statements.`;
   }
 
+  private async generateViaOllama(
+    prompt: string,
+    cfg: { baseUrl: string; model: string }
+  ): Promise<string> {
+    return new Promise((resolve) => {
+      const body = JSON.stringify({
+        model: cfg.model,
+        messages: [{ role: 'user', content: prompt }],
+        stream: false,
+      });
+
+      const urlStr = cfg.baseUrl.replace(/\/$/, '') + '/api/chat';
+      let urlObj: URL;
+      try {
+        urlObj = new URL(urlStr);
+      } catch {
+        this.outputChannel.appendLine(`Invalid Ollama base URL: ${cfg.baseUrl}`);
+        vscode.window.showErrorMessage(
+          `Automated QA — Ollama Error: Invalid base URL "${cfg.baseUrl}".`
+        );
+        resolve('');
+        return;
+      }
+
+      const useHttps = urlObj.protocol === 'https:';
+      const lib = useHttps ? https : http;
+
+      const req = lib.request(
+        {
+          hostname: urlObj.hostname,
+          port: urlObj.port || (useHttps ? 443 : 80),
+          path: urlObj.pathname,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body),
+          },
+          timeout: 180000,
+        },
+        (res) => {
+          let data = '';
+          res.on('data', (c) => (data += c));
+          res.on('end', () => {
+            if (res.statusCode && res.statusCode >= 400) {
+              const detail = data.slice(0, 200);
+              this.outputChannel.appendLine(`Ollama HTTP ${res.statusCode}: ${detail}`);
+              vscode.window.showErrorMessage(
+                `Automated QA — Ollama HTTP ${res.statusCode}: ${detail}`
+              );
+              resolve('');
+              return;
+            }
+            try {
+              const parsed = JSON.parse(data);
+              resolve(parsed?.message?.content || parsed?.response || '');
+            } catch {
+              this.outputChannel.appendLine('Failed to parse Ollama response');
+              resolve('');
+            }
+          });
+        }
+      );
+      req.on('error', (e) => {
+        this.outputChannel.appendLine(`Ollama connection error: ${e.message}`);
+        vscode.window.showErrorMessage(
+          `Automated QA — Cannot reach Ollama at ${cfg.baseUrl}. Is the server running?`
+        );
+        resolve('');
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        vscode.window.showErrorMessage(
+          `Automated QA — Ollama request timed out. Model: ${cfg.model}.`
+        );
+        resolve('');
+      });
+      req.write(body);
+      req.end();
+    });
+  }
+
   private async generateViaCopilot(prompt: string): Promise<string> {
     try {
-      const models = await vscode.lm.selectChatModels({ family: 'gpt-4o' });
-      const model = models[0];
-      if (!model) {
-        vscode.window.showErrorMessage('No Copilot model available.');
-        return '';
-      }
+      const model = await selectBestCopilotModel();
 
       const messages = [vscode.LanguageModelChatMessage.User(prompt)];
       const response = await model.sendRequest(messages, {}, new vscode.CancellationTokenSource().token);
@@ -175,6 +268,7 @@ Start the file with the appropriate import statements.`;
       return fullResponse;
     } catch (err: any) {
       this.outputChannel.appendLine(`Copilot test generation error: ${err.message}`);
+      vscode.window.showErrorMessage(`Test generation failed: ${err.message}`);
       return '';
     }
   }

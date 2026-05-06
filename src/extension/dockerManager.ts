@@ -134,6 +134,7 @@ export class DockerManager {
       try {
         const ok = await this.httpGet(url);
         if (ok) {
+          this._isStackRunning = true;
           return true;
         }
       } catch {
@@ -144,6 +145,21 @@ export class DockerManager {
 
     this.outputChannel.appendLine('Health check timed out after ' + timeoutMs / 1000 + 's.');
     return false;
+  }
+
+  /**
+   * Single quick probe — does NOT start anything.
+   * Returns true and marks the stack as running if the sidecar is already healthy.
+   * Used on extension activation to avoid an unnecessary compose up.
+   */
+  async isSidecarHealthy(): Promise<boolean> {
+    try {
+      const ok = await this.httpGet(`${this.sidecarBaseUrl}/health`);
+      if (ok) { this._isStackRunning = true; }
+      return ok;
+    } catch {
+      return false;
+    }
   }
 
   async postToSidecar<T = any>(endpoint: string, body: Record<string, any>): Promise<T> {
