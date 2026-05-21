@@ -14,7 +14,10 @@ RUN npm install -g jest vitest ts-jest @types/jest typescript && \
 # Create a working directory for test execution
 RUN mkdir -p /app/tests
 
+# Copy test runner agent server
+COPY server.js /app/server.js
+
 EXPOSE 5000
 
-# Keep container running (tests are executed via exec from sidecar)
-CMD ["tail", "-f", "/dev/null"]
+# Start the test runner agent server
+CMD ["node", "/app/server.js"]

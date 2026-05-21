@@ -64,83 +64,122 @@ export class WorkspaceIndexer {
     // Read package.json
     if (workspaceFolder) {
       workspaceRoot = this.findProjectRoot(activeFilePath, workspaceFolder.uri.fsPath);
-      const pkgPath = path.join(workspaceRoot, 'package.json');
-      try {
-        const pkgRaw = fs.readFileSync(pkgPath, 'utf-8');
-        const pkg = JSON.parse(pkgRaw);
-        projectName = pkg.name || 'unknown';
-        dependencies = pkg.dependencies || {};
-        devDependencies = pkg.devDependencies || {};
+      const boundaryFsPath = workspaceFolder.uri.fsPath;
 
-        // Detect test framework
-        const allDeps = { ...dependencies, ...devDependencies };
-        if (allDeps['vitest']) {
-          testFramework = 'vitest';
-          testConfigPath = this.findFirstExisting(workspaceRoot, [
-            'vitest.config.ts',
-            'vitest.config.mts',
-            'vitest.config.js',
-            'vite.config.ts',
-            'vite.config.mts',
-            'vite.config.js',
-          ]);
-        } else if (allDeps['jest']) {
-          testFramework = 'jest';
-          testConfigPath = this.findFirstExisting(workspaceRoot, [
-            'jest.config.ts',
-            'jest.config.js',
-            'jest.config.mjs',
-            'jest.config.cjs',
-          ]);
-          if (!testConfigPath && pkg.jest) {
-            testConfigPath = 'package.json#jest';
+      // Find all package.json files from workspaceRoot up to the workspace boundary to aggregate dependencies
+      const pkgPaths: string[] = [];
+      let currentDir = workspaceRoot;
+      const boundary = path.resolve(boundaryFsPath);
+      
+      while (true) {
+        const pkgFile = path.join(currentDir, 'package.json');
+        if (fs.existsSync(pkgFile)) {
+          pkgPaths.push(pkgFile);
+        }
+        if (currentDir === boundary) {
+          break;
+        }
+        const parent = path.dirname(currentDir);
+        if (parent === currentDir) {
+          break;
+        }
+        currentDir = parent;
+      }
+
+      let pkgJestExists = false;
+      for (let i = pkgPaths.length - 1; i >= 0; i--) {
+        try {
+          const pkgRaw = fs.readFileSync(pkgPaths[i], 'utf-8');
+          const pkg = JSON.parse(pkgRaw);
+          if (pkg.name) {
+            projectName = pkg.name;
           }
+          dependencies = { ...dependencies, ...(pkg.dependencies || {}) };
+          devDependencies = { ...devDependencies, ...(pkg.devDependencies || {}) };
+          if (pkg.jest) {
+            pkgJestExists = true;
+          }
+        } catch {
+          // ignore
         }
+      }
 
-        const viteConfigPath = this.findFirstExisting(workspaceRoot, [
-          'vitest.config.ts',
-          'vitest.config.mts',
-          'vitest.config.js',
-          'vite.config.ts',
-          'vite.config.mts',
-          'vite.config.js',
-        ]);
-        if (testFramework === 'unknown' && viteConfigPath) {
-          testFramework = 'vitest';
-          testConfigPath = viteConfigPath;
-        }
+      const allDeps = { ...dependencies, ...devDependencies };
 
-        // Detect language
-        if (allDeps['typescript']) {
-          language = 'typescript';
-        } else {
-          language = 'javascript';
-        }
-      } catch {
-        // No package.json
+      // 1. Search upwards for configuration files first to establish high-confidence detection.
+      // If a Vitest/Vite config file is present, prioritize Vitest over Jest.
+      const vitestConfig = this.findConfigUpwards(workspaceRoot, boundaryFsPath, [
+        'vitest.config.ts',
+        'vitest.config.mts',
+        'vitest.config.js',
+        'vite.config.ts',
+        'vite.config.mts',
+        'vite.config.js',
+      ]);
+
+      const jestConfig = this.findConfigUpwards(workspaceRoot, boundaryFsPath, [
+        'jest.config.ts',
+        'jest.config.js',
+        'jest.config.mjs',
+        'jest.config.cjs',
+        'jest.config.json',
+      ]);
+
+      if (vitestConfig) {
+        testFramework = 'vitest';
+        testConfigPath = vitestConfig;
+      } else if (jestConfig) {
+        testFramework = 'jest';
+        testConfigPath = jestConfig;
+      } else if (pkgJestExists) {
+        testFramework = 'jest';
+        testConfigPath = 'package.json#jest';
+      } else if (allDeps['vitest']) {
+        testFramework = 'vitest';
+      } else if (allDeps['jest']) {
+        testFramework = 'jest';
+      }
+
+      // Detect language
+      if (allDeps['typescript']) {
+        language = 'typescript';
+      } else {
+        language = 'javascript';
       }
 
       // Check for Python
-      const requirementsTxt = path.join(workspaceRoot, 'requirements.txt');
-      const pyprojectToml = path.join(workspaceRoot, 'pyproject.toml');
-      const pytestIni = path.join(workspaceRoot, 'pytest.ini');
+      const requirementsTxtRel = this.findConfigUpwards(workspaceRoot, boundaryFsPath, ['requirements.txt']);
+      const pyprojectTomlRel = this.findConfigUpwards(workspaceRoot, boundaryFsPath, ['pyproject.toml']);
+      const pytestIniRel = this.findConfigUpwards(workspaceRoot, boundaryFsPath, ['pytest.ini']);
+
+      const requirementsTxt = requirementsTxtRel ? (path.isAbsolute(requirementsTxtRel) ? requirementsTxtRel : path.join(workspaceRoot, requirementsTxtRel)) : '';
+      const pyprojectToml = pyprojectTomlRel ? (path.isAbsolute(pyprojectTomlRel) ? pyprojectTomlRel : path.join(workspaceRoot, pyprojectTomlRel)) : '';
+      const pytestIni = pytestIniRel ? (path.isAbsolute(pytestIniRel) ? pytestIniRel : path.join(workspaceRoot, pytestIniRel)) : '';
+
       if (
         this.fileLooksLikePython(activeFilePath) ||
-        fs.existsSync(requirementsTxt) ||
-        fs.existsSync(pyprojectToml) ||
-        fs.existsSync(pytestIni)
+        requirementsTxt ||
+        pyprojectToml ||
+        pytestIni
       ) {
         language = 'python';
-        const pythonConfig = this.findFirstExisting(workspaceRoot, [
+        const pythonConfig = this.findConfigUpwards(workspaceRoot, boundaryFsPath, [
           'pyproject.toml',
           'pytest.ini',
           'tox.ini',
           'setup.cfg',
         ]);
-        if (pythonConfig || this.fileContains(requirementsTxt, /pytest/i) || this.fileContains(pyprojectToml, /pytest/i)) {
+        const hasPytestInRequirements = requirementsTxt && this.fileContains(requirementsTxt, /pytest/i);
+        const hasPytestInPyproject = pyprojectToml && this.fileContains(pyprojectToml, /pytest/i);
+
+        if (pythonConfig || hasPytestInRequirements || hasPytestInPyproject) {
           testFramework = 'pytest';
           testConfigPath = pythonConfig;
         }
+      }
+
+      if (language === 'python' && testFramework === 'unknown') {
+        testFramework = 'pytest';
       }
     }
 
@@ -205,6 +244,30 @@ export class WorkspaceIndexer {
       if (fs.existsSync(path.join(root, relativePath))) {
         return relativePath;
       }
+    }
+    return '';
+  }
+
+  private findConfigUpwards(startDir: string, boundaryDir: string, relativePaths: string[]): string {
+    let current = path.resolve(startDir);
+    const boundary = boundaryDir ? path.resolve(boundaryDir) : current;
+
+    while (true) {
+      for (const rel of relativePaths) {
+        const fullPath = path.join(current, rel);
+        if (fs.existsSync(fullPath)) {
+          const relativeToStart = path.relative(startDir, fullPath);
+          return relativeToStart || rel;
+        }
+      }
+      if (current === boundary) {
+        break;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) {
+        break;
+      }
+      current = parent;
     }
     return '';
   }

@@ -87,11 +87,19 @@ export class DockerManager {
 
     try {
       const cmd = await this.getComposeCmd();
-      this.outputChannel.appendLine(`Running: ${cmd} up -d --build`);
+      const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || cwd;
+      this.outputChannel.appendLine(`Running: ${cmd} up -d --build with WORKSPACE_ROOT=${workspaceFolder}`);
 
       const { stdout, stderr } = await execAsync(
         `${cmd} up -d --build`,
-        { cwd, timeout: 180000 } // 3 min — first build can take time
+        {
+          cwd,
+          timeout: 180000, // 3 min — first build can take time
+          env: {
+            ...process.env,
+            WORKSPACE_ROOT: workspaceFolder,
+          }
+        }
       );
       if (stdout) { this.outputChannel.appendLine(stdout); }
       if (stderr) { this.outputChannel.appendLine(stderr); }
@@ -117,7 +125,15 @@ export class DockerManager {
 
     try {
       const cmd = await this.getComposeCmd();
-      await execAsync(`${cmd} down`, { cwd, timeout: 30000 });
+      const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || cwd;
+      await execAsync(`${cmd} down`, {
+        cwd,
+        timeout: 30000,
+        env: {
+          ...process.env,
+          WORKSPACE_ROOT: workspaceFolder,
+        }
+      });
       this._isStackRunning = false;
       this.outputChannel.appendLine('Docker stack stopped.');
     } catch (err: any) {
@@ -158,6 +174,35 @@ export class DockerManager {
       if (ok) { this._isStackRunning = true; }
       return ok;
     } catch {
+      return false;
+    }
+  }
+
+  async isSidecarWorkspaceCorrect(workspaceFolder: string): Promise<boolean> {
+    const probeFilename = `.qa-probe-${Date.now()}-${Math.random().toString(36).substring(2, 9)}.tmp`;
+    const probePath = path.join(workspaceFolder, probeFilename);
+    try {
+      fs.writeFileSync(probePath, 'probe', 'utf-8');
+      
+      const response = await this.postToSidecar<{ exists: boolean }>('/check-file', {
+        relativePath: probeFilename
+      });
+      
+      try {
+        fs.unlinkSync(probePath);
+      } catch {
+        // ignore
+      }
+      
+      return Boolean(response && response.exists);
+    } catch (err) {
+      try {
+        if (fs.existsSync(probePath)) {
+          fs.unlinkSync(probePath);
+        }
+      } catch {
+        // ignore
+      }
       return false;
     }
   }

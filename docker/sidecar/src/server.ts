@@ -1,8 +1,10 @@
 import express from 'express';
 import cors from 'cors';
+import * as fs from 'fs';
+import * as path from 'path';
 import { aiComplete } from './aiProxy';
 import { runVisualCheck } from './visualCheck';
-import { runTests } from './testRunner';
+import { runTests, installPackage } from './testRunner';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '4777', 10);
@@ -13,6 +15,22 @@ app.use(express.json({ limit: '10mb' }));
 // Health check
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Check if a file exists in the workspace volume mount
+app.post('/check-file', (req, res) => {
+  try {
+    const { relativePath } = req.body;
+    if (!relativePath) {
+      return res.status(400).json({ error: 'Missing relativePath' });
+    }
+    const fullPath = path.join('/app/workspace', relativePath);
+    const exists = fs.existsSync(fullPath);
+    res.json({ exists });
+  } catch (err: any) {
+    console.error('Check file error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // AI Completion proxy
@@ -48,11 +66,11 @@ app.post('/visual-check', async (req, res) => {
 // Test runner
 app.post('/run-tests', async (req, res) => {
   try {
-    const { filePath, fileContent, framework, workspaceRoot, testConfigPath } = req.body;
+    const { filePath, fileContent, framework, workspaceRoot, testConfigPath, cwd } = req.body;
     if (!filePath || !fileContent) {
       return res.status(400).json({ error: 'Missing filePath or fileContent' });
     }
-    const result = await runTests(filePath, fileContent, framework || 'jest', workspaceRoot, testConfigPath);
+    const result = await runTests(filePath, fileContent, framework || 'jest', workspaceRoot, testConfigPath, cwd);
     res.json(result);
   } catch (err: any) {
     console.error('Test runner error:', err.message);
@@ -60,6 +78,22 @@ app.post('/run-tests', async (req, res) => {
   }
 });
 
+// Install package inside container
+app.post('/install-package', async (req, res) => {
+  try {
+    const { packageManager, packageName, cwd, workspaceRoot } = req.body;
+    if (!packageName) {
+      return res.status(400).json({ error: 'Missing packageName' });
+    }
+    const result = await installPackage(packageManager || 'npm', packageName, cwd, workspaceRoot);
+    res.json(result);
+  } catch (err: any) {
+    console.error('Install package error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Automated QA Sidecar running on port ${PORT}`);
 });
+

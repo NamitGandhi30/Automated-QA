@@ -8,7 +8,7 @@ services:
       - TEST_RUNNER_URL=http://test-runner:5000
       - PORT=4777
     volumes:
-      - .:/app/workspace:ro
+      - "${WORKSPACE_ROOT:-.}:/app/workspace"
     networks:
       - aq-bridge
     restart: unless-stopped
@@ -27,7 +27,7 @@ services:
   test-runner:
     build: ./docker/test-runner
     volumes:
-      - .:/app/workspace:ro
+      - "${WORKSPACE_ROOT:-.}:/app/workspace"
     deploy:
       resources:
         limits:

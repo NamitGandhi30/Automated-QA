@@ -35,7 +35,7 @@ export interface TestRunResult {
   failureReason?: string;
 }
 
-export class TestArchitect {
+export class TestArchitect implements vscode.Disposable {
   private secretManager: SecretManager;
   private workspaceIndexer: WorkspaceIndexer;
   private dockerManager: DockerManager;
@@ -43,6 +43,7 @@ export class TestArchitect {
   private _lastGenerated: GeneratedTests | null = null;
   private _onTestsGenerated = new vscode.EventEmitter<GeneratedTests>();
   readonly onTestsGenerated = this._onTestsGenerated.event;
+  private generatedTestFiles = new Set<string>();
 
   constructor(
     secretManager: SecretManager,
@@ -54,6 +55,21 @@ export class TestArchitect {
     this.workspaceIndexer = workspaceIndexer;
     this.dockerManager = dockerManager;
     this.outputChannel = outputChannel;
+  }
+
+  dispose() {
+    this.outputChannel.appendLine('TestArchitect: Cleaning up generated test files...');
+    for (const filePath of this.generatedTestFiles) {
+      try {
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+          this.outputChannel.appendLine(`Deleted generated test file: ${filePath}`);
+        }
+      } catch (err: any) {
+        this.outputChannel.appendLine(`Failed to delete generated test file "${filePath}": ${err.message || err}`);
+      }
+    }
+    this.generatedTestFiles.clear();
   }
 
   get lastGenerated(): GeneratedTests | null {
@@ -123,6 +139,7 @@ export class TestArchitect {
 
       // Write to file
       fs.writeFileSync(tests.filePath, tests.fullContent, 'utf-8');
+      this.generatedTestFiles.add(tests.filePath);
       this.outputChannel.appendLine(`Tests written to ${tests.filePath}`);
 
       // Open the file
@@ -338,7 +355,8 @@ Start the file with the appropriate import statements.`;
     testFilePath: string,
     framework: string,
     workspaceRoot: string,
-    testConfigPath: string
+    testConfigPath: string,
+    retryCount = 0
   ): Promise<TestRunResult> {
     const testContent = this.readFileIfExists(testFilePath);
     const resolvedFramework = framework === 'unknown'
@@ -362,44 +380,253 @@ Start the file with the appropriate import statements.`;
       return result;
     }
 
-    this.outputChannel.appendLine(`Running tests from ${cwd}`);
-    this.outputChannel.appendLine(`Command: ${commandInfo.command}`);
+    const boundary = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    const depsOk = await this.ensureDependencies(cwd, boundary, resolvedFramework);
+    if (!depsOk) {
+      return {
+        status: 'error',
+        command: commandInfo.command || '',
+        cwd,
+        exitCode: null,
+        output: '',
+        framework: resolvedFramework,
+        testFilePath,
+        failureReason: `Required test dependencies are missing and automatic installation failed.`,
+      };
+    }
 
-    try {
-      const { stdout, stderr } = await execAsync(commandInfo.command, {
-        cwd,
-        timeout: 120000,
-        maxBuffer: 1024 * 1024 * 10,
-        windowsHide: true,
-      });
-      const output = stdout + (stderr ? `\n${stderr}` : '');
-      const result: TestRunResult = {
-        status: 'passed',
-        command: commandInfo.command,
-        cwd,
-        exitCode: 0,
-        output,
-        framework: resolvedFramework,
-        testFilePath,
-      };
-      this.outputChannel.appendLine(`Test output:\n${output}`);
-      return result;
-    } catch (err: any) {
-      const output = `${err.stdout || ''}${err.stderr ? `\n${err.stderr}` : ''}`.trim();
-      const exitCode = typeof err.code === 'number' ? err.code : 1;
-      const result: TestRunResult = {
-        status: exitCode === 0 ? 'passed' : 'failed',
-        command: commandInfo.command,
-        cwd,
-        exitCode,
-        output: output || err.message || '',
-        framework: resolvedFramework,
-        testFilePath,
-        failureReason: this.describeFailure(resolvedFramework, exitCode, output || err.message || '', testConfigPath),
-      };
-      this.outputChannel.appendLine(`Test run failed with exit code ${exitCode}: ${result.failureReason}`);
-      this.outputChannel.appendLine(`Test output:\n${result.output}`);
-      return result;
+    let result: TestRunResult | null = null;
+
+    if (this.dockerManager.isStackRunning) {
+      const activeFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (activeFolder) {
+        try {
+          const workspaceCorrect = await this.dockerManager.isSidecarWorkspaceCorrect(activeFolder);
+          if (!workspaceCorrect) {
+            this.outputChannel.appendLine(`Sidecar workspace mount is mismatching or outdated. Aligning sidecar with ${activeFolder}...`);
+            await vscode.window.withProgress({
+              location: vscode.ProgressLocation.Notification,
+              title: `Automated QA: Aligning sidecar workspace mount...`,
+              cancellable: false
+            }, async (progress) => {
+              progress.report({ message: `Stopping sidecar container...` });
+              await this.dockerManager.stopStack();
+              progress.report({ message: `Starting sidecar container with correct workspace...` });
+              await this.dockerManager.startStack();
+              await this.dockerManager.pollUntilReady();
+            });
+            this.outputChannel.appendLine(`Docker stack successfully aligned with workspace: ${activeFolder}`);
+          }
+        } catch (err: any) {
+          this.outputChannel.appendLine(`Failed to align sidecar workspace: ${err.message || err}`);
+        }
+      }
+
+      this.outputChannel.appendLine(`Docker stack is running. Routing test execution to sidecar...`);
+      try {
+        result = await this.dockerManager.postToSidecar<TestRunResult>('/run-tests', {
+          filePath: testFilePath,
+          fileContent: testContent,
+          framework: resolvedFramework,
+          workspaceRoot: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || workspaceRoot,
+          cwd,
+          testConfigPath,
+        });
+
+        if (result && result.output) {
+          result.output = this.stripAnsi(result.output);
+        }
+
+        this.outputChannel.appendLine(`Sidecar test run status: ${result.status}`);
+        if (result.failureReason) {
+          this.outputChannel.appendLine(`Sidecar failure reason: ${result.failureReason}`);
+        }
+        this.outputChannel.appendLine(`Sidecar test output:\n${result.output}`);
+      } catch (err: any) {
+        this.outputChannel.appendLine(`Sidecar test run failed: ${err.message || err}. Falling back to local execution.`);
+      }
+    }
+
+    if (!result) {
+      if (resolvedFramework === 'jest' || resolvedFramework === 'vitest') {
+        const boundary = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+        if (!this.hasNodeModules(cwd, boundary)) {
+          const result: TestRunResult = {
+            status: 'error',
+            command: commandInfo.command || '',
+            cwd,
+            exitCode: null,
+            output: '',
+            framework: resolvedFramework,
+            testFilePath,
+            failureReason: 'Project dependencies are not installed (node_modules not found). Please run "npm install" in your project directory first.',
+          };
+          this.outputChannel.appendLine(`Local test run skipped: ${result.failureReason}`);
+          return result;
+        }
+
+        if (!this.isFrameworkDeclared(cwd, boundary, resolvedFramework)) {
+          const result: TestRunResult = {
+            status: 'error',
+            command: commandInfo.command || '',
+            cwd,
+            exitCode: null,
+            output: '',
+            framework: resolvedFramework,
+            testFilePath,
+            failureReason: `Test framework "${resolvedFramework}" is not declared in your package.json dependencies. Please run "${this.getInstallCommand(resolvedFramework)}" in your project directory first.`,
+          };
+          this.outputChannel.appendLine(`Local test run skipped: ${result.failureReason}`);
+          return result;
+        }
+      }
+
+      this.outputChannel.appendLine(`Running tests locally from ${cwd}`);
+      this.outputChannel.appendLine(`Command: ${commandInfo.command}`);
+
+      try {
+        const { stdout, stderr } = await execAsync(commandInfo.command, {
+          cwd,
+          timeout: 120000,
+          maxBuffer: 1024 * 1024 * 10,
+          windowsHide: true,
+        });
+        const output = this.stripAnsi(stdout + (stderr ? `\n${stderr}` : ''));
+        result = {
+          status: 'passed',
+          command: commandInfo.command,
+          cwd,
+          exitCode: 0,
+          output,
+          framework: resolvedFramework,
+          testFilePath,
+        };
+        this.outputChannel.appendLine(`Test output:\n${output}`);
+      } catch (err: any) {
+        const output = this.stripAnsi(`${err.stdout || ''}${err.stderr ? `\n${err.stderr}` : ''}`.trim() || err.message || '');
+        const exitCode = typeof err.code === 'number' ? err.code : 1;
+        result = {
+          status: exitCode === 0 ? 'passed' : 'failed',
+          command: commandInfo.command,
+          cwd,
+          exitCode,
+          output,
+          framework: resolvedFramework,
+          testFilePath,
+          failureReason: this.describeFailure(resolvedFramework, exitCode, output, testConfigPath, cwd),
+        };
+        this.outputChannel.appendLine(`Test run failed with exit code ${exitCode}: ${result.failureReason}`);
+        this.outputChannel.appendLine(`Test output:\n${result.output}`);
+      }
+    }
+
+    // Auto-install missing packages and retry
+    if (result && (result.status === 'failed' || result.status === 'error')) {
+      const missingPkg = this.extractMissingPackage(result.output, resolvedFramework);
+      if (missingPkg && retryCount < 2) {
+        this.outputChannel.appendLine(`Detected missing dependency: "${missingPkg}". Attempting auto-installation...`);
+        const pm = this.getPackageManager(cwd, boundary);
+        const installCmd = this.getInstallPackageCommand(pm, missingPkg);
+        const pkgDir = this.findNearestPackageRoot(path.join(cwd, 'dummy.js'), boundary) || cwd;
+
+        try {
+          await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: `Automated QA: Installing missing package "${missingPkg}"...`,
+            cancellable: false
+          }, async (progress) => {
+            progress.report({ message: `Running ${installCmd} in ${pkgDir}...` });
+            await execAsync(installCmd, { cwd: pkgDir });
+          });
+          this.outputChannel.appendLine(`Successfully installed package "${missingPkg}". Retrying test run (attempt ${retryCount + 1})...`);
+          return this.runInWorkspace(testFilePath, framework, workspaceRoot, testConfigPath, retryCount + 1);
+        } catch (installErr: any) {
+          const hostMsg = installErr.message || installErr;
+          this.outputChannel.appendLine(`Host auto-installation of "${missingPkg}" failed: ${hostMsg}`);
+
+          // If Docker stack is running, attempt to install inside the container as fallback
+          if (this.dockerManager.isStackRunning) {
+            this.outputChannel.appendLine(`Docker stack is running. Retrying installation of "${missingPkg}" inside container...`);
+            try {
+              await vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: `Automated QA: Installing "${missingPkg}" in container...`,
+                cancellable: false
+              }, async (progress) => {
+                progress.report({ message: `Running installation in Docker container...` });
+                const installResult = await this.dockerManager.postToSidecar<{ success: boolean; output: string; error?: string }>('/install-package', {
+                  packageManager: pm,
+                  packageName: missingPkg,
+                  cwd,
+                  workspaceRoot: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || workspaceRoot,
+                });
+                if (!installResult.success) {
+                  throw new Error(installResult.error || installResult.output || 'Installation failed inside container.');
+                }
+              });
+              this.outputChannel.appendLine(`Successfully installed "${missingPkg}" inside container. Retrying test run (attempt ${retryCount + 1})...`);
+              return this.runInWorkspace(testFilePath, framework, workspaceRoot, testConfigPath, retryCount + 1);
+            } catch (containerErr: any) {
+              const containerMsg = containerErr.message || containerErr;
+              this.outputChannel.appendLine(`Container installation of "${missingPkg}" failed: ${containerMsg}`);
+              result.failureReason = `${result.failureReason || ''}\n(Auto-install of "${missingPkg}" failed: Host: ${hostMsg} / Container: ${containerMsg})`;
+            }
+          } else {
+            result.failureReason = `${result.failureReason || ''}\n(Auto-install of "${missingPkg}" failed: ${hostMsg})`;
+          }
+        }
+      }
+    }
+
+    return result;
+  }
+
+  private extractMissingPackage(output: string, framework: string): string | null {
+    if (framework === 'pytest') {
+      const match = /ModuleNotFoundError:\s*No\s*module\s*named\s*['"]([^'"]+)['"]/i.exec(output) ||
+                    /ImportError:\s*No\s*module\s*named\s*['"]([^'"]+)['"]/i.exec(output);
+      if (match) {
+        return match[1].trim();
+      }
+      return null;
+    }
+
+    // JS/TS frameworks (Jest/Vitest)
+    const match = /Failed\s*to\s*resolve\s*import\s*["']([^"']+)["']/i.exec(output) ||
+                  /Cannot\s*find\s*module\s*['"]([^'"]+)['"]/i.exec(output) ||
+                  /Cannot\s*find\s*package\s*['"]([^'"]+)['"]/i.exec(output) ||
+                  /ERR_MODULE_NOT_FOUND.*package\s*['"]([^'"]+)['"]/i.exec(output);
+
+    if (match) {
+      const importPath = match[1].trim();
+      // Skip relative/absolute imports or aliases
+      if (importPath.startsWith('.') || importPath.startsWith('/') || importPath.startsWith('\\') || /^[A-Za-z]:/.test(importPath)) {
+        return null;
+      }
+      if (importPath.startsWith('~/') || importPath.startsWith('@/')) {
+        return null;
+      }
+      
+      // Resolve package name (e.g. axios/lib/adapters/http -> axios)
+      if (importPath.startsWith('@')) {
+        const parts = importPath.split('/');
+        if (parts.length >= 2) {
+          if (!parts[1].trim()) { return null; }
+          return `${parts[0]}/${parts[1]}`;
+        }
+      }
+      return importPath.split('/')[0];
+    }
+
+    return null;
+  }
+
+  private getInstallPackageCommand(packageManager: 'npm' | 'yarn' | 'pnpm' | 'bun', packageName: string): string {
+    switch (packageManager) {
+      case 'yarn': return `yarn add ${packageName}`;
+      case 'pnpm': return `pnpm add ${packageName}`;
+      case 'bun': return `bun add ${packageName}`;
+      default: return `npm install ${packageName}`;
     }
   }
 
@@ -415,7 +642,11 @@ Start the file with the appropriate import statements.`;
       : '';
 
     if (framework === 'jest') {
-      return { command: `npx --no-install jest --runTestsByPath ${relativeTestPath}${configArg} --verbose` };
+      let configOption = configArg;
+      if (!configOption && (testFilePath.endsWith('.ts') || testFilePath.endsWith('.tsx'))) {
+        configOption = ' --config "{\\"preset\\":\\"ts-jest\\"}"';
+      }
+      return { command: `npx --no-install jest --runTestsByPath ${relativeTestPath}${configOption} --verbose` };
     }
     if (framework === 'vitest') {
       return { command: `npx --no-install vitest run ${relativeTestPath}${configArg}` };
@@ -430,12 +661,31 @@ Start the file with the appropriate import statements.`;
     };
   }
 
-  private describeFailure(framework: string, exitCode: number, output: string, testConfigPath: string): string {
+  private describeFailure(framework: string, exitCode: number, output: string, testConfigPath: string, cwd?: string): string {
+    if (/EROFS|read-only file system/i.test(output)) {
+      return 'The Docker workspace volume is mounted as read-only. Please restart the Docker stack from the VS Code extension sidebar to update the volume mounts.';
+    }
+    if (framework === 'jest' || framework === 'vitest') {
+      const boundary = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+      if (cwd && !this.hasNodeModules(cwd, boundary)) {
+        return 'Project dependencies are not installed (node_modules not found). Please run "npm install" in your project directory first.';
+      }
+      if (cwd && !this.isFrameworkDeclared(cwd, boundary, framework)) {
+        return `Test framework "${framework}" is not declared in your package.json dependencies. Please run "${this.getInstallCommand(framework)}" in your project directory first.`;
+      }
+    }
     if (/could not find a config file|Can't find a root directory|No tests found/i.test(output)) {
       return `${framework} could not find runnable tests or project config from the workspace root. Config detected: ${testConfigPath || 'none'}.`;
     }
-    if (/Cannot find module|Module not found|ERR_MODULE_NOT_FOUND|ImportError|ModuleNotFoundError/i.test(output)) {
-      return 'The generated test could not import the code under test or a project dependency.';
+    if (/Cannot find module|Module not found|ERR_MODULE_NOT_FOUND|ImportError|ModuleNotFoundError|Failed to resolve import/i.test(output)) {
+      const lines = output.split('\n');
+      const matchedLines = lines.filter(l => 
+        /Cannot find module|Module not found|ERR_MODULE_NOT_FOUND|ImportError|ModuleNotFoundError|Failed to resolve import/i.test(l)
+      );
+      const details = matchedLines.length > 0
+        ? matchedLines.map(l => l.trim()).slice(0, 3).join('\n')
+        : output.slice(0, 300);
+      return `The generated test could not import the code under test or a project dependency. Details:\n${details}`;
     }
     if (
       /command not found|not recognized as an internal or external command|could not determine executable/i.test(output) ||
@@ -454,7 +704,7 @@ Start the file with the appropriate import statements.`;
       return 'npm install -D vitest';
     }
     if (framework === 'jest') {
-      return 'npm install -D jest @jest/globals';
+      return 'npm install -D jest @jest/globals ts-jest';
     }
     if (framework === 'pytest') {
       return 'python -m pip install pytest';
@@ -579,11 +829,175 @@ Start the file with the appropriate import statements.`;
     return 'unknown';
   }
 
+  private hasNodeModules(startDir: string, boundaryDir: string): boolean {
+    let current = path.resolve(startDir);
+    const boundary = boundaryDir ? path.resolve(boundaryDir) : current;
+    while (true) {
+      if (fs.existsSync(path.join(current, 'node_modules'))) {
+        return true;
+      }
+      if (current === boundary) {
+        break;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) {
+        break;
+      }
+      current = parent;
+    }
+    return false;
+  }
+
+  private isFrameworkDeclared(startDir: string, boundaryDir: string, framework: string): boolean {
+    let current = path.resolve(startDir);
+    const boundary = boundaryDir ? path.resolve(boundaryDir) : current;
+    while (true) {
+      const pkgPath = path.join(current, 'package.json');
+      if (fs.existsSync(pkgPath)) {
+        try {
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+          const allDeps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+          if (allDeps[framework]) {
+            return true;
+          }
+        } catch {
+          // ignore
+        }
+      }
+      if (current === boundary) {
+        break;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) {
+        break;
+      }
+      current = parent;
+    }
+    return false;
+  }
+
   private quote(value: string): string {
     return `"${value.replace(/"/g, '\\"')}"`;
   }
 
   private toPosix(value: string): string {
     return value.replace(/\\/g, '/');
+  }
+
+  private getPackageManager(dir: string, boundaryDir: string): 'npm' | 'yarn' | 'pnpm' | 'bun' {
+    let current = path.resolve(dir);
+    const boundary = boundaryDir ? path.resolve(boundaryDir) : current;
+    while (true) {
+      if (fs.existsSync(path.join(current, 'package-lock.json'))) { return 'npm'; }
+      if (fs.existsSync(path.join(current, 'yarn.lock'))) { return 'yarn'; }
+      if (fs.existsSync(path.join(current, 'pnpm-lock.yaml'))) { return 'pnpm'; }
+      if (fs.existsSync(path.join(current, 'bun.lockb')) || fs.existsSync(path.join(current, 'bun.lock'))) { return 'bun'; }
+      if (current === boundary) { break; }
+      const parent = path.dirname(current);
+      if (parent === current) { break; }
+      current = parent;
+    }
+    return 'npm';
+  }
+
+  private getInstallDependenciesCommand(packageManager: 'npm' | 'yarn' | 'pnpm' | 'bun'): string {
+    switch (packageManager) {
+      case 'yarn': return 'yarn install';
+      case 'pnpm': return 'pnpm install';
+      case 'bun': return 'bun install';
+      default: return 'npm install';
+    }
+  }
+
+  private getInstallFrameworkCommand(packageManager: 'npm' | 'yarn' | 'pnpm' | 'bun', framework: string): string {
+    if (framework === 'pytest') {
+      return 'python -m pip install pytest';
+    }
+    const packages = framework === 'jest' ? 'jest @jest/globals ts-jest' : 'vitest';
+    switch (packageManager) {
+      case 'yarn': return `yarn add -D ${packages}`;
+      case 'pnpm': return `pnpm add -D ${packages}`;
+      case 'bun': return `bun add -D ${packages}`;
+      default: return `npm install -D ${packages}`;
+    }
+  }
+
+  private async ensureDependencies(cwd: string, boundary: string, framework: string): Promise<boolean> {
+    if (framework === 'jest' || framework === 'vitest') {
+      const pm = this.getPackageManager(cwd, boundary);
+      
+      // 1. Check if node_modules exists
+      if (!this.hasNodeModules(cwd, boundary)) {
+        const installCmd = this.getInstallDependenciesCommand(pm);
+        this.outputChannel.appendLine(`node_modules not found in ${cwd} or parents. Automatically running: ${installCmd}`);
+        try {
+          await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: `Automated QA: Installing project dependencies...`,
+            cancellable: false
+          }, async (progress) => {
+            progress.report({ message: `Running ${installCmd} in ${cwd}...` });
+            await execAsync(installCmd, { cwd });
+          });
+          this.outputChannel.appendLine('Dependencies installed successfully.');
+        } catch (err: any) {
+          const msg = `Failed to install dependencies: ${err.message || err}`;
+          this.outputChannel.appendLine(msg);
+          vscode.window.showErrorMessage(msg);
+          return false;
+        }
+      }
+
+      // 2. Check if framework is declared
+      if (!this.isFrameworkDeclared(cwd, boundary, framework)) {
+        const installCmd = this.getInstallFrameworkCommand(pm, framework);
+        this.outputChannel.appendLine(`Test framework "${framework}" not declared in package.json. Automatically running: ${installCmd}`);
+        try {
+          const pkgDir = this.findNearestPackageRoot(path.join(cwd, 'dummy.js'), boundary) || cwd;
+          await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: `Automated QA: Installing ${framework}...`,
+            cancellable: false
+          }, async (progress) => {
+            progress.report({ message: `Running ${installCmd} in ${pkgDir}...` });
+            await execAsync(installCmd, { cwd: pkgDir });
+          });
+          this.outputChannel.appendLine(`Framework "${framework}" installed successfully.`);
+        } catch (err: any) {
+          const msg = `Failed to install framework "${framework}": ${err.message || err}`;
+          this.outputChannel.appendLine(msg);
+          vscode.window.showErrorMessage(msg);
+          return false;
+        }
+      }
+    } else if (framework === 'pytest') {
+      try {
+        await execAsync('pytest --version');
+      } catch {
+        const installCmd = 'python -m pip install pytest';
+        this.outputChannel.appendLine(`pytest not found in environment. Automatically running: ${installCmd}`);
+        try {
+          await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: `Automated QA: Installing pytest...`,
+            cancellable: false
+          }, async (progress) => {
+            progress.report({ message: `Running ${installCmd}...` });
+            await execAsync(installCmd);
+          });
+          this.outputChannel.appendLine('pytest installed successfully.');
+        } catch (err: any) {
+          const msg = `Failed to install pytest: ${err.message || err}`;
+          this.outputChannel.appendLine(msg);
+          vscode.window.showErrorMessage(msg);
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  private stripAnsi(str: string): string {
+    return str.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '');
   }
 }

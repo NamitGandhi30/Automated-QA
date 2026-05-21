@@ -56,7 +56,8 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.window.registerWebviewViewProvider('automated-qa.sidebarView', sidebarProvider),
     vscode.languages.registerCodeLensProvider({ scheme: 'file' }, codeLensProvider),
     vscode.tasks.registerTaskProvider('automated-qa', new OmniCheckTaskProvider(prAutomator)),
-    outputChannel
+    outputChannel,
+    testArchitect
   );
 
   // Register commands
@@ -89,11 +90,22 @@ export async function activate(context: vscode.ExtensionContext) {
       outputChannel.appendLine('Docker detected. Probing sidecar health...');
       const alreadyHealthy = await dockerManager.isSidecarHealthy();
 
-      if (alreadyHealthy) {
-        outputChannel.appendLine('Sidecar already running and healthy — skipping compose up.');
+      let workspaceMatched = false;
+      const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (alreadyHealthy && workspaceFolder) {
+        workspaceMatched = await dockerManager.isSidecarWorkspaceCorrect(workspaceFolder);
+      }
+
+      if (alreadyHealthy && workspaceMatched) {
+        outputChannel.appendLine('Sidecar already running with correct workspace mount — skipping compose up.');
         sidebarProvider.updateDockerStatus(true);
       } else {
-        outputChannel.appendLine('Sidecar not running. Starting Docker stack...');
+        if (alreadyHealthy && !workspaceMatched && workspaceFolder) {
+          outputChannel.appendLine('Sidecar is running but mounts a different workspace. Restarting sidecar...');
+          await dockerManager.stopStack();
+        } else {
+          outputChannel.appendLine('Sidecar not running. Starting Docker stack...');
+        }
         await dockerManager.startStack();
         const healthy = await dockerManager.pollUntilReady();
         if (healthy) {
