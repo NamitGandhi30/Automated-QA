@@ -217,6 +217,20 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           });
           const output = await this.testArchitect.runTests(pending.filePath);
           this.postMessage({ type: 'testOutput', data: output });
+        } else {
+          this.postMessage({
+            type: 'testOutput',
+            data: {
+              status: 'error',
+              command: '',
+              cwd: '',
+              exitCode: null,
+              output: '',
+              framework: 'unknown',
+              testFilePath: '',
+              failureReason: 'No tests have been generated yet. Click "Generate Tests" first.',
+            },
+          });
         }
         break;
       case 'runVisualCheck':

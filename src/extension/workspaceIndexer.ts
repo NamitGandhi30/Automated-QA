@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import { readTsconfigPaths } from './codeIntelligence';
 
 export interface WorkspaceContext {
   testFramework: 'jest' | 'vitest' | 'pytest' | 'unknown';
@@ -14,6 +15,9 @@ export interface WorkspaceContext {
   activeFileContent: string;
   activeFilePath: string;
   adjacentSnippets: { path: string; content: string }[];
+  pathAliases: Record<string, string>;
+  nearbyTestFiles: { path: string; content: string }[];
+  moduleSystem: 'commonjs' | 'esm' | 'unknown';
 }
 
 export class WorkspaceIndexer {
@@ -219,6 +223,45 @@ export class WorkspaceIndexer {
       }
     }
 
+    // Path aliases from tsconfig
+    const pathAliases = readTsconfigPaths(workspaceRoot);
+
+    // Nearby test files
+    const nearbyTestFiles: { path: string; content: string }[] = [];
+    if (activeFilePath) {
+      const testDir = path.dirname(activeFilePath);
+      const testDirs = [testDir, path.join(testDir, '__tests__'), path.join(testDir, 'tests')];
+      for (const td of testDirs) {
+        if (!fs.existsSync(td)) { continue; }
+        try {
+          const files = fs.readdirSync(td).filter(f =>
+            /\.(test|spec)\.(ts|tsx|js|jsx)$/.test(f) && !f.endsWith('.qa.test.ts')
+          );
+          for (const f of files.slice(0, 2)) {
+            nearbyTestFiles.push({
+              path: path.join(td, f),
+              content: fs.readFileSync(path.join(td, f), 'utf-8').slice(0, 3000),
+            });
+          }
+        } catch { /* ignore */ }
+        if (nearbyTestFiles.length > 0) { break; }
+      }
+    }
+
+    // Module system detection
+    let moduleSystem: 'commonjs' | 'esm' | 'unknown' = 'unknown';
+    if (workspaceFolder) {
+      // Check package.json type field
+      const rootPkgPath = path.join(workspaceRoot, 'package.json');
+      if (fs.existsSync(rootPkgPath)) {
+        try {
+          const pkg = JSON.parse(fs.readFileSync(rootPkgPath, 'utf-8'));
+          if (pkg.type === 'module') { moduleSystem = 'esm'; }
+          else if (pkg.type === 'commonjs' || !pkg.type) { moduleSystem = 'commonjs'; }
+        } catch { /* ignore */ }
+      }
+    }
+
     return {
       testFramework,
       language,
@@ -231,6 +274,9 @@ export class WorkspaceIndexer {
       activeFileContent,
       activeFilePath,
       adjacentSnippets,
+      pathAliases,
+      nearbyTestFiles,
+      moduleSystem,
     };
   }
 

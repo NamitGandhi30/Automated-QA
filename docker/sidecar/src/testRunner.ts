@@ -77,7 +77,11 @@ export async function runTests(
       };
     }
 
-    if (!isFrameworkDeclared(mappedCwd, boundary, framework)) {
+    const isTypeScript = filePath.endsWith('.ts') || filePath.endsWith('.tsx');
+    const hasFramework = isFrameworkDeclared(mappedCwd, boundary, framework) &&
+      (framework !== 'jest' || !isTypeScript || isFrameworkDeclared(mappedCwd, boundary, 'ts-jest'));
+
+    if (!hasFramework) {
       return {
         status: 'error',
         command: '',
@@ -91,36 +95,67 @@ export async function runTests(
     }
   }
 
+  let mappedConfigPath = '';
+  if (testConfigPath) {
+    if (path.isAbsolute(testConfigPath) || /^[A-Za-z]:/.test(testConfigPath)) {
+      mappedConfigPath = mapIntoWorkspace(testConfigPath, workspaceRoot || '', mountedRoot) || testConfigPath;
+    } else {
+      mappedConfigPath = testConfigPath;
+    }
+  }
+
+  let tempConfigPath = '';
+  let runConfigPath = mappedConfigPath;
+
+  if (framework === 'jest' && !mappedConfigPath) {
+    const existingConfig = findExistingJestConfig(mappedCwd);
+    if (existingConfig) {
+      runConfigPath = existingConfig;
+    } else if (filePath.endsWith('.ts') || filePath.endsWith('.tsx')) {
+      tempConfigPath = path.join(mappedCwd, '.jest.config.qa.json');
+      const inlineConfigObj = {
+        preset: 'ts-jest',
+        transform: { '^.+\\.tsx?$': ['ts-jest', { isolatedModules: true }] },
+      };
+      try {
+        fs.writeFileSync(tempConfigPath, JSON.stringify(inlineConfigObj, null, 2), 'utf-8');
+        runConfigPath = tempConfigPath;
+      } catch (err: any) {
+        console.error(`Failed to write temp Jest config in container: ${err.message}`);
+        tempConfigPath = '';
+      }
+    }
+  }
+
   const relativeTestPath = quote(toPosix(path.relative(mappedCwd, mappedTestPath) || mappedTestPath));
-  const configArg = testConfigPath && !testConfigPath.includes('#')
-    ? ` --config ${quote(toPosix(testConfigPath))}`
+  const configArg = runConfigPath && !runConfigPath.includes('#')
+    ? ` --config ${quote(toPosix(runConfigPath))}`
     : '';
 
   // Determine whether to use local node_modules executables or global ones
   let cmd = '';
   if (framework === 'jest') {
-    let configOption = configArg;
-    if (!configOption && (filePath.endsWith('.ts') || filePath.endsWith('.tsx'))) {
-      configOption = ' --config "{\\"preset\\":\\"ts-jest\\"}"';
-    }
     const localJest = path.join(mappedCwd, 'node_modules', '.bin', 'jest');
     if (fs.existsSync(localJest)) {
-      cmd = `npx --no-install jest --runTestsByPath ${relativeTestPath}${configOption} --verbose 2>&1`;
+      cmd = `npx --no-install jest --runTestsByPath ${relativeTestPath}${configArg} --verbose --passWithNoTests 2>&1`;
     } else {
-      cmd = `jest --runTestsByPath ${relativeTestPath}${configOption} --verbose 2>&1`;
+      cmd = `jest --runTestsByPath ${relativeTestPath}${configArg} --verbose --passWithNoTests 2>&1`;
     }
   } else if (framework === 'vitest') {
     const localVitest = path.join(mappedCwd, 'node_modules', '.bin', 'vitest');
     if (fs.existsSync(localVitest)) {
-      cmd = `npx --no-install vitest run ${relativeTestPath}${configArg} 2>&1`;
+      cmd = `npx --no-install vitest run ${relativeTestPath}${configArg} --reporter=verbose --pool=forks --testTimeout=10000 --passWithNoTests 2>&1`;
     } else {
-      cmd = `vitest run ${relativeTestPath}${configArg} 2>&1`;
+      cmd = `vitest run ${relativeTestPath}${configArg} --reporter=verbose --pool=forks --testTimeout=10000 --passWithNoTests 2>&1`;
     }
   } else if (framework === 'pytest') {
     cmd = `python -m pytest ${relativeTestPath} -v 2>&1`;
   }
 
   if (!cmd) {
+    if (tempConfigPath && fs.existsSync(tempConfigPath)) {
+      try { fs.unlinkSync(tempConfigPath); } catch {}
+    }
     return {
       status: 'skipped',
       command: '',
@@ -156,7 +191,7 @@ export async function runTests(
       };
     } else {
       console.log(`Tests completed with exit code: ${exitCode}`);
-      const failureReason = describeFailure(framework, exitCode, output, testConfigPath || '', mappedCwd);
+      const failureReason = describeFailure(framework, exitCode, output, runConfigPath || '', mappedCwd, filePath);
       return {
         status: 'failed',
         command: cmd,
@@ -180,6 +215,15 @@ export async function runTests(
       testFilePath: filePath,
       failureReason: `Test runner agent communication failed: ${err.message}`,
     };
+  } finally {
+    if (tempConfigPath && fs.existsSync(tempConfigPath)) {
+      try {
+        fs.unlinkSync(tempConfigPath);
+        console.log(`Deleted temp Jest config in container: ${tempConfigPath}`);
+      } catch (err: any) {
+        console.error(`Failed to delete temp Jest config in container: ${err.message}`);
+      }
+    }
   }
 }
 
@@ -223,7 +267,7 @@ function postRequest(urlStr: string, body: any): Promise<{ exitCode: number; std
   });
 }
 
-function describeFailure(framework: string, exitCode: number, output: string, testConfigPath: string, cwd?: string): string {
+function describeFailure(framework: string, exitCode: number, output: string, testConfigPath: string, cwd?: string, filePath?: string): string {
   if (/EROFS|read-only file system/i.test(output)) {
     return 'The Docker workspace volume is mounted as read-only. Please restart the Docker stack from the VS Code extension sidebar to update the volume mounts.';
   }
@@ -232,8 +276,13 @@ function describeFailure(framework: string, exitCode: number, output: string, te
     if (cwd && !hasNodeModules(cwd, boundary)) {
       return 'Project dependencies are not installed (node_modules not found). Please run "npm install" in your project directory first.';
     }
-    if (cwd && !isFrameworkDeclared(cwd, boundary, framework)) {
-      return `Test framework "${framework}" is not declared in your package.json dependencies. Please run "${getInstallCommand(framework)}" in your project directory first.`;
+    if (cwd) {
+      const isTypeScript = filePath ? (filePath.endsWith('.ts') || filePath.endsWith('.tsx')) : false;
+      const hasFramework = isFrameworkDeclared(cwd, boundary, framework) &&
+        (framework !== 'jest' || !isTypeScript || isFrameworkDeclared(cwd, boundary, 'ts-jest'));
+      if (!hasFramework) {
+        return `Test framework "${framework}" is not declared in your package.json dependencies. Please run "${getInstallCommand(framework)}" in your project directory first.`;
+      }
     }
   }
   if (/could not find a config file|Can't find a root directory|No tests found/i.test(output)) {
@@ -256,9 +305,46 @@ function describeFailure(framework: string, exitCode: number, output: string, te
     return `${framework} is not available in this workspace. Make sure it is installed, then run again.`;
   }
   if (/timeout/i.test(output)) {
-    return 'The test command timed out after 120 seconds.';
+    return 'The test command timed out after 180 seconds. This usually means a generated test has a hanging promise or infinite loop. Check the test file for unresolved promises.';
   }
-  return `The test command exited with code ${exitCode}.`;
+  // Assertion failures — tests ran but some failed. This is normal test behavior, not a pipeline bug.
+  if (/FAIL|✕|✗|×|failed/i.test(output)) {
+    // 1. Jest format: Tests: 5 failed, 5 passed, 10 total
+    const jestMatch = output.match(/Tests:\s*(?:(\d+)\s+failed,\s*)?(?:(\d+)\s+passed)?/i);
+    if (jestMatch) {
+      const failed = jestMatch[1] || '0';
+      const passed = jestMatch[2] || '0';
+      if (failed !== '0' || passed !== '0') {
+        return `Tests ran: ${passed} passed, ${failed} failed. Some test assertions did not match expected values. Review the test output for details.`;
+      }
+    }
+    // 2. Vitest format: Tests  5 failed | 5 passed (10)
+    const vitestMatch = output.match(/Tests\s+(?:(\d+)\s+failed)?\s*(?:\|)?\s*(?:(\d+)\s+passed)?/i);
+    if (vitestMatch) {
+      const failed = vitestMatch[1] || '0';
+      const passed = vitestMatch[2] || '0';
+      if (failed !== '0' || passed !== '0') {
+        return `Tests ran: ${passed} passed, ${failed} failed. Some test assertions did not match expected values. Review the test output for details.`;
+      }
+    }
+    // 3. Fallback matching
+    const failCount = output.match(/(\d+)\s+(?:failing|failed)/i);
+    const passCount = output.match(/(\d+)\s+(?:passing|passed)/i);
+    if (failCount || passCount) {
+      return `Tests ran: ${passCount?.[1] || '?'} passed, ${failCount?.[1] || '?'} failed. Some test assertions did not match expected values. Review the test output for details.`;
+    }
+  }
+  if (/SyntaxError|Unexpected token|Parse error/i.test(output)) {
+    return 'The generated test file contains a syntax error. The AI produced invalid code that could not be parsed.';
+  }
+  if (/ReferenceError:\s*(\w+)\s+is not defined/i.test(output)) {
+    const match = output.match(/ReferenceError:\s*(\w+)\s+is not defined/i);
+    return `The generated test references "${match?.[1]}" which is not defined. The AI likely used an import or variable that doesn't exist in the project.`;
+  }
+  if (/TypeError/i.test(output)) {
+    return 'The generated test has a TypeError — likely calling a function incorrectly or using a mocked value wrong. Review mock setup in the test file.';
+  }
+  return `The test command exited with code ${exitCode}. Review the test output above for details.`;
 }
 
 function hasNodeModules(startDir: string, boundaryDir: string): boolean {
@@ -295,6 +381,9 @@ function isFrameworkDeclared(startDir: string, boundaryDir: string, framework: s
       } catch {
         // ignore
       }
+    }
+    if (fs.existsSync(path.join(current, 'node_modules'))) {
+      break;
     }
     if (current === boundary) {
       break;
@@ -351,6 +440,40 @@ function getInstallCommand(framework: string): string {
     return 'python -m pip install pytest';
   }
   return `npm install -D ${framework}`;
+}
+
+function findExistingJestConfig(cwd: string): string {
+  const configNames = [
+    'jest.config.ts',
+    'jest.config.js',
+    'jest.config.mjs',
+    'jest.config.cjs',
+    'jest.config.json',
+  ];
+  let current = cwd;
+  const boundary = '/app/workspace';
+  for (let i = 0; i < 10; i++) {
+    for (const name of configNames) {
+      const configPath = path.join(current, name);
+      if (fs.existsSync(configPath)) {
+        return configPath;
+      }
+    }
+    const pkgPath = path.join(current, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+        if (pkg.jest) {
+          return '';
+        }
+      } catch { /* ignore */ }
+    }
+    if (path.resolve(current) === path.resolve(boundary)) { break; }
+    const parent = path.dirname(current);
+    if (parent === current) { break; }
+    current = parent;
+  }
+  return '';
 }
 
 export async function installPackage(

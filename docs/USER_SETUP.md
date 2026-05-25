@@ -17,7 +17,7 @@ Optional but recommended:
 ## Clone the repository
 
 ```powershell
-git clone https://github.com/NamitGandhi30/Automated-QA.git
+git clone   
 cd "Automated QA"
 ```
 
