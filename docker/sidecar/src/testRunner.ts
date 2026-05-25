@@ -23,6 +23,7 @@ export async function runTests(
   framework: string;
   testFilePath: string;
   failureReason?: string;
+  failureSummary?: string;
 }> {
   console.log(`Running tests in container: framework=${framework}, file=${filePath}, cwd=${cwd}`);
 
@@ -201,19 +202,22 @@ export async function runTests(
         framework,
         testFilePath: filePath,
         failureReason,
+        failureSummary: summarizeTestOutput(framework, output),
       };
     }
   } catch (err: any) {
     console.error(`Delegation error: ${err.message}`);
+    const errMsg = err.message || 'Sidecar failed to communicate with the test-runner container.';
     return {
       status: 'error',
       command: cmd,
       cwd: mappedCwd,
       exitCode: null,
-      output: err.message || 'Sidecar failed to communicate with the test-runner container.',
+      output: errMsg,
       framework,
       testFilePath: filePath,
       failureReason: `Test runner agent communication failed: ${err.message}`,
+      failureSummary: summarizeTestOutput(framework, errMsg),
     };
   } finally {
     if (tempConfigPath && fs.existsSync(tempConfigPath)) {
@@ -521,5 +525,180 @@ export async function installPackage(
   } catch (err: any) {
     return { success: false, output: err.message || '', error: err.message };
   }
+}
+
+export function summarizeTestOutput(framework: string, output: string): string {
+  if (!output) { return ''; }
+  const lines = output.split('\n');
+  const failures: string[] = [];
+
+  if (framework === 'jest') {
+    let currentFailure: string[] = [];
+    let capturing = false;
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      
+      // Jest failure block starts with a bullet point (●)
+      if (trimmed.startsWith('●') || trimmed.startsWith('•')) {
+        if (currentFailure.length > 0) {
+          failures.push(cleanJestFailure(currentFailure.join('\n')));
+        }
+        currentFailure = [trimmed];
+        capturing = true;
+      } else if (capturing) {
+        // Stop capturing if we hit Jest summary metrics at the end of output
+        if (/^(Test Suites:|Tests:|Snapshots:|Time:|Ran all test suites)/.test(trimmed)) {
+          capturing = false;
+          if (currentFailure.length > 0) {
+            failures.push(cleanJestFailure(currentFailure.join('\n')));
+            currentFailure = [];
+          }
+        } else {
+          currentFailure.push(line);
+        }
+      }
+    }
+    if (capturing && currentFailure.length > 0) {
+      failures.push(cleanJestFailure(currentFailure.join('\n')));
+    }
+  } else if (framework === 'vitest') {
+    let currentFailure: string[] = [];
+    let capturing = false;
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+
+      // Vitest failures often start with ❌ or ❯ indicating a failed block
+      if (trimmed.startsWith('❌') || trimmed.startsWith('FAIL') || /^(❯|❯\s+)/.test(trimmed)) {
+        if (currentFailure.length > 0) {
+          failures.push(cleanVitestFailure(currentFailure.join('\n')));
+        }
+        currentFailure = [trimmed];
+        capturing = true;
+      } else if (capturing) {
+        if (/^(Test Files:|Tests:|Snapshots:|Time:|Ran all test suites)/.test(trimmed)) {
+          capturing = false;
+          if (currentFailure.length > 0) {
+            failures.push(cleanVitestFailure(currentFailure.join('\n')));
+            currentFailure = [];
+          }
+        } else {
+          currentFailure.push(line);
+        }
+      }
+    }
+    if (capturing && currentFailure.length > 0) {
+      failures.push(cleanVitestFailure(currentFailure.join('\n')));
+    }
+  } else if (framework === 'pytest') {
+    let currentFailure: string[] = [];
+    let capturing = false;
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      
+      // Pytest failures are denoted by headers like _________________ test_name _________________
+      if (trimmed.startsWith('_____') && trimmed.endsWith('_____')) {
+        if (currentFailure.length > 0) {
+          failures.push(cleanPytestFailure(currentFailure.join('\n')));
+        }
+        currentFailure = [trimmed];
+        capturing = true;
+      } else if (capturing) {
+        if (trimmed.startsWith('===') && (trimmed.includes('short test summary info') || trimmed.includes('failed') || trimmed.includes('passed'))) {
+          capturing = false;
+          if (currentFailure.length > 0) {
+            failures.push(cleanPytestFailure(currentFailure.join('\n')));
+            currentFailure = [];
+          }
+        } else {
+          currentFailure.push(line);
+        }
+      }
+    }
+    if (capturing && currentFailure.length > 0) {
+      failures.push(cleanPytestFailure(currentFailure.join('\n')));
+    }
+  }
+
+  // If no structured failures were parsed but there are other recognizable errors (like compilation/runtime crashes)
+  if (failures.length === 0) {
+    const errorLines = lines.filter(l => /SyntaxError|TypeError|ReferenceError|AssertionError/i.test(l));
+    if (errorLines.length > 0) {
+      return errorLines.slice(0, 5).map(l => l.trim()).join('\n');
+    }
+    return '';
+  }
+
+  return failures.join('\n\n');
+}
+
+function cleanJestFailure(block: string): string {
+  const lines = block.split('\n');
+  const header = lines[0];
+  const rest: string[] = [];
+  let foundSrcLine = false;
+
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith('at ') && (trimmed.includes('node_modules') || trimmed.includes('internal/') || trimmed.includes('node:internal'))) {
+      continue;
+    }
+
+    if (trimmed.startsWith('at ')) {
+      if (!foundSrcLine) {
+        rest.push(line);
+        foundSrcLine = true;
+      }
+      continue;
+    }
+
+    rest.push(line);
+  }
+
+  return `${header}\n${rest.join('\n').replace(/\n{3,}/g, '\n\n')}`.trim();
+}
+
+function cleanVitestFailure(block: string): string {
+  const lines = block.split('\n');
+  const header = lines[0];
+  const rest: string[] = [];
+  let foundSrcLine = false;
+
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith('at ') && (trimmed.includes('node_modules') || trimmed.includes('internal/') || trimmed.includes('node:internal'))) {
+      continue;
+    }
+
+    if (trimmed.startsWith('at ')) {
+      if (!foundSrcLine) {
+        rest.push(line);
+        foundSrcLine = true;
+      }
+      continue;
+    }
+
+    rest.push(line);
+  }
+
+  return `${header}\n${rest.join('\n').replace(/\n{3,}/g, '\n\n')}`.trim();
+}
+
+function cleanPytestFailure(block: string): string {
+  const lines = block.split('\n');
+  const header = lines[0];
+  
+  const filtered = lines.slice(1).filter(l => {
+    const tl = l.trim();
+    return tl.startsWith('>') || tl.startsWith('E ') || (tl.includes('.py:') && tl.includes('AssertionError'));
+  });
+
+  return `${header}\n${filtered.join('\n')}`.trim();
 }
 

@@ -34,6 +34,7 @@ export interface TestRunResult {
   framework: string;
   testFilePath: string;
   failureReason?: string;
+  failureSummary?: string;
 }
 
 export class TestArchitect implements vscode.Disposable {
@@ -161,15 +162,142 @@ export class TestArchitect implements vscode.Disposable {
       this._lastGenerated = tests;
 
       // Write to file
+      // Write to file
       fs.writeFileSync(tests.filePath, tests.fullContent, 'utf-8');
       this.generatedTestFiles.add(tests.filePath);
       this.outputChannel.appendLine(`Tests written to ${tests.filePath}`);
 
+      // Perform auto-run and self-healing loop
+      this.outputChannel.appendLine(`Executing initial test run to verify correctness...`);
+      const initialRunResult = await this.runTests(tests.filePath);
+      
+      let finalTests = tests;
+      if (initialRunResult.status === 'failed' || initialRunResult.status === 'error') {
+        finalTests = await this.autoRepairTests(
+          tests,
+          initialRunResult,
+          sourceFilePath,
+          selectedCode,
+          codeIntel,
+          ctx,
+          provider,
+          apiKey
+        );
+      } else {
+        this.outputChannel.appendLine(`All generated tests passed on the first run!`);
+      }
+
       // Open the file
-      const doc = await vscode.workspace.openTextDocument(tests.filePath);
+      const doc = await vscode.workspace.openTextDocument(finalTests.filePath);
       await vscode.window.showTextDocument(doc, vscode.ViewColumn.Beside);
 
-      this._onTestsGenerated.fire(tests);
+      this._onTestsGenerated.fire(finalTests);
+      return finalTests;
+    }
+
+    return tests;
+  }
+
+  private async autoRepairTests(
+    tests: GeneratedTests,
+    initialResult: TestRunResult,
+    sourceFilePath: string,
+    selectedCode: string,
+    codeIntel: CodeIntelligence,
+    ctx: any,
+    provider: string,
+    apiKey: string | undefined
+  ): Promise<GeneratedTests> {
+    let result = initialResult;
+    let attempt = 1;
+    const maxAttempts = 2;
+    let currentContent = tests.fullContent;
+
+    while ((result.status === 'failed' || result.status === 'error') && attempt <= maxAttempts) {
+      this.outputChannel.appendLine(`[Self-Healing] Test execution failed on attempt ${attempt}. Running auto-repair...`);
+      
+      const repairPrompt = `You are a Test Architect. The test suite you generated failed execution.
+Please fix the test suite to make it pass.
+
+### Source Code Under Test:
+\`\`\`typescript
+${selectedCode}
+\`\`\`
+
+### Generated Test Code That Failed:
+\`\`\`typescript
+${currentContent}
+\`\`\`
+
+### Test Execution Failure Logs:
+\`\`\`
+${result.failureSummary || result.output}
+\`\`\`
+
+### Instructions:
+1. Carefully analyze the Test Execution Failure Logs.
+2. Identify why it failed:
+   - Check if you asserted an incorrect return value or exception type that does not match the actual source code logic.
+   - Check if your test inputs triggered code validation boundaries (like length limits, character checks, or null/undefined guards) causing the function to exit early or return a different format.
+   - Check if you mocked a dependency incorrectly or missed importing a function/variable.
+3. Correct the generated test suite so that all assertions are 100% correct and aligned with the actual code behavior.
+4. Keep the three test tiers (TIER 1: NORMAL, TIER 2: EDGE CASE, TIER 3: STRESS TEST).
+5. Do NOT change the import statement path.
+6. Return ONLY the corrected test file content, ready to be written to disk. No markdown wrapping.
+7. Start the file with the appropriate import statements.`;
+
+      this.outputChannel.appendLine(`[Self-Healing] Generating repair attempt ${attempt} using ${provider}...`);
+      
+      let repairedResponse: string;
+      if (provider === 'copilot') {
+        repairedResponse = await this.generateViaCopilot(repairPrompt);
+      } else if (provider === 'ollama') {
+        const ollamaCfg = await this.secretManager.getOllamaConfigWithKey();
+        repairedResponse = await this.generateViaOllama(repairPrompt, ollamaCfg);
+      } else {
+        repairedResponse = await this.generateViaSidecar(repairPrompt, provider, apiKey!);
+      }
+
+      if (!repairedResponse) {
+        this.outputChannel.appendLine(`[Self-Healing] Failed to generate repair response.`);
+        break;
+      }
+
+      // Parse the repaired output
+      const repairedClean = this.parseTestOutput(repairedResponse, sourceFilePath, ctx);
+      if (!repairedClean) {
+        this.outputChannel.appendLine(`[Self-Healing] Could not parse repaired test response.`);
+        break;
+      }
+
+      // Validate the repaired content
+      const validatedContent = this.validateGeneratedTests(repairedClean.fullContent, sourceFilePath, ctx, codeIntel);
+      
+      // Write repaired content to file
+      fs.writeFileSync(tests.filePath, validatedContent, 'utf-8');
+      this.outputChannel.appendLine(`[Self-Healing] Wrote repair attempt ${attempt} to ${tests.filePath}`);
+
+      // Run tests again
+      this.outputChannel.appendLine(`[Self-Healing] Running tests for repair attempt ${attempt}...`);
+      result = await this.runTests(tests.filePath);
+      
+      currentContent = validatedContent;
+      attempt++;
+    }
+
+    if (result.status === 'passed') {
+      this.outputChannel.appendLine(`[Self-Healing] Successfully repaired the tests! All tests are now passing.`);
+      
+      // Re-parse and update the tests object
+      const finalSplit = this.parseTestOutput(currentContent, sourceFilePath, ctx);
+      if (finalSplit) {
+        tests.fullContent = currentContent;
+        tests.normal = finalSplit.normal;
+        tests.edgeCase = finalSplit.edgeCase;
+        tests.stress = finalSplit.stress;
+      }
+    } else {
+      this.outputChannel.appendLine(`[Self-Healing] Auto-repair was unable to make all tests pass after ${maxAttempts} attempts.`);
     }
 
     return tests;
@@ -916,6 +1044,9 @@ Start the file with the appropriate import statements.`;
           if (result && result.output) {
             result.output = this.stripAnsi(result.output);
           }
+          if (result && !result.failureSummary && (result.status === 'failed' || result.status === 'error')) {
+            result.failureSummary = summarizeTestOutput(resolvedFramework, result.output);
+          }
 
           this.outputChannel.appendLine(`Sidecar test run status: ${result.status}`);
           if (result.failureReason) {
@@ -994,6 +1125,7 @@ Start the file with the appropriate import statements.`;
             framework: resolvedFramework,
             testFilePath,
             failureReason: this.describeFailure(resolvedFramework, exitCode, output, runConfigPath, cwd, testFilePath),
+            failureSummary: summarizeTestOutput(resolvedFramework, output),
           };
           this.outputChannel.appendLine(`Test run failed with exit code ${exitCode}: ${result.failureReason}`);
           this.outputChannel.appendLine(`Test output:\n${result.output}`);
@@ -1585,4 +1717,179 @@ Start the file with the appropriate import statements.`;
   private stripAnsi(str: string): string {
     return str.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '');
   }
+}
+
+export function summarizeTestOutput(framework: string, output: string): string {
+  if (!output) { return ''; }
+  const lines = output.split('\n');
+  const failures: string[] = [];
+
+  if (framework === 'jest') {
+    let currentFailure: string[] = [];
+    let capturing = false;
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      
+      // Jest failure block starts with a bullet point (●)
+      if (trimmed.startsWith('●') || trimmed.startsWith('•')) {
+        if (currentFailure.length > 0) {
+          failures.push(cleanJestFailure(currentFailure.join('\n')));
+        }
+        currentFailure = [trimmed];
+        capturing = true;
+      } else if (capturing) {
+        // Stop capturing if we hit Jest summary metrics at the end of output
+        if (/^(Test Suites:|Tests:|Snapshots:|Time:|Ran all test suites)/.test(trimmed)) {
+          capturing = false;
+          if (currentFailure.length > 0) {
+            failures.push(cleanJestFailure(currentFailure.join('\n')));
+            currentFailure = [];
+          }
+        } else {
+          currentFailure.push(line);
+        }
+      }
+    }
+    if (capturing && currentFailure.length > 0) {
+      failures.push(cleanJestFailure(currentFailure.join('\n')));
+    }
+  } else if (framework === 'vitest') {
+    let currentFailure: string[] = [];
+    let capturing = false;
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+
+      // Vitest failures often start with ❌ or ❯ indicating a failed block
+      if (trimmed.startsWith('❌') || trimmed.startsWith('FAIL') || /^(❯|❯\s+)/.test(trimmed)) {
+        if (currentFailure.length > 0) {
+          failures.push(cleanVitestFailure(currentFailure.join('\n')));
+        }
+        currentFailure = [trimmed];
+        capturing = true;
+      } else if (capturing) {
+        if (/^(Test Files:|Tests:|Snapshots:|Time:|Ran all test suites)/.test(trimmed)) {
+          capturing = false;
+          if (currentFailure.length > 0) {
+            failures.push(cleanVitestFailure(currentFailure.join('\n')));
+            currentFailure = [];
+          }
+        } else {
+          currentFailure.push(line);
+        }
+      }
+    }
+    if (capturing && currentFailure.length > 0) {
+      failures.push(cleanVitestFailure(currentFailure.join('\n')));
+    }
+  } else if (framework === 'pytest') {
+    let currentFailure: string[] = [];
+    let capturing = false;
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      
+      // Pytest failures are denoted by headers like _________________ test_name _________________
+      if (trimmed.startsWith('_____') && trimmed.endsWith('_____')) {
+        if (currentFailure.length > 0) {
+          failures.push(cleanPytestFailure(currentFailure.join('\n')));
+        }
+        currentFailure = [trimmed];
+        capturing = true;
+      } else if (capturing) {
+        if (trimmed.startsWith('===') && (trimmed.includes('short test summary info') || trimmed.includes('failed') || trimmed.includes('passed'))) {
+          capturing = false;
+          if (currentFailure.length > 0) {
+            failures.push(cleanPytestFailure(currentFailure.join('\n')));
+            currentFailure = [];
+          }
+        } else {
+          currentFailure.push(line);
+        }
+      }
+    }
+    if (capturing && currentFailure.length > 0) {
+      failures.push(cleanPytestFailure(currentFailure.join('\n')));
+    }
+  }
+
+  // If no structured failures were parsed but there are other recognizable errors (like compilation/runtime crashes)
+  if (failures.length === 0) {
+    const errorLines = lines.filter(l => /SyntaxError|TypeError|ReferenceError|AssertionError/i.test(l));
+    if (errorLines.length > 0) {
+      return errorLines.slice(0, 5).map(l => l.trim()).join('\n');
+    }
+    return '';
+  }
+
+  return failures.join('\n\n');
+}
+
+function cleanJestFailure(block: string): string {
+  const lines = block.split('\n');
+  const header = lines[0];
+  const rest: string[] = [];
+  let foundSrcLine = false;
+
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith('at ') && (trimmed.includes('node_modules') || trimmed.includes('internal/') || trimmed.includes('node:internal'))) {
+      continue;
+    }
+
+    if (trimmed.startsWith('at ')) {
+      if (!foundSrcLine) {
+        rest.push(line);
+        foundSrcLine = true;
+      }
+      continue;
+    }
+
+    rest.push(line);
+  }
+
+  return `${header}\n${rest.join('\n').replace(/\n{3,}/g, '\n\n')}`.trim();
+}
+
+function cleanVitestFailure(block: string): string {
+  const lines = block.split('\n');
+  const header = lines[0];
+  const rest: string[] = [];
+  let foundSrcLine = false;
+
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith('at ') && (trimmed.includes('node_modules') || trimmed.includes('internal/') || trimmed.includes('node:internal'))) {
+      continue;
+    }
+
+    if (trimmed.startsWith('at ')) {
+      if (!foundSrcLine) {
+        rest.push(line);
+        foundSrcLine = true;
+      }
+      continue;
+    }
+
+    rest.push(line);
+  }
+
+  return `${header}\n${rest.join('\n').replace(/\n{3,}/g, '\n\n')}`.trim();
+}
+
+function cleanPytestFailure(block: string): string {
+  const lines = block.split('\n');
+  const header = lines[0];
+  
+  const filtered = lines.slice(1).filter(l => {
+    const tl = l.trim();
+    return tl.startsWith('>') || tl.startsWith('E ') || (tl.includes('.py:') && tl.includes('AssertionError'));
+  });
+
+  return `${header}\n${filtered.join('\n')}`.trim();
 }

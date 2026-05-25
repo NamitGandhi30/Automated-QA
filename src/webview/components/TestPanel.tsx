@@ -20,6 +20,7 @@ interface Props {
     framework: string;
     testFilePath: string;
     failureReason?: string;
+    failureSummary?: string;
   } | string | null;
   postMessage: (msg: any) => void;
 }
@@ -109,7 +110,7 @@ const TestPanel: React.FC<Props> = ({ tests, testOutput, postMessage }) => {
           <div style={{ fontSize: '11px', fontWeight: 600, marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '1px', opacity: 0.7 }}>
             Test Run
           </div>
-          <div className="glass-card" style={{ padding: '8px 10px' }}>
+          <div className="glass-card" style={{ padding: '8px 10px', marginBottom: '8px' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', alignItems: 'center', marginBottom: '6px' }}>
               <span className={`badge ${
                 runResult.status === 'passed' ? 'badge-success' :
@@ -131,10 +132,31 @@ const TestPanel: React.FC<Props> = ({ tests, testOutput, postMessage }) => {
               <div><strong>CWD:</strong> {runResult.cwd || '-'}</div>
               <div><strong>Command:</strong> {runResult.command || (runResult.status === 'running' ? 'Starting...' : '-')}</div>
             </div>
+            {runResult.failureSummary && (
+              <div style={{ marginTop: '8px', borderTop: '1px dashed var(--vscode-panel-border)', paddingTop: '8px' }}>
+                <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--vscode-errorForeground)', marginBottom: '4px' }}>
+                  Failure Summary:
+                </div>
+                <div className="code-block" style={{ margin: 0, padding: '8px', fontSize: '11px', whiteSpace: 'pre-wrap', maxHeight: '300px', overflowY: 'auto' }}>
+                  {runResult.failureSummary}
+                </div>
+              </div>
+            )}
           </div>
-          <div className="code-block" style={{ maxHeight: '200px', overflowY: 'auto' }}>
-            {runResult.output || (runResult.status === 'running' ? 'Running test command...' : 'No output captured.')}
-          </div>
+          {runResult.status !== 'running' ? (
+            <details style={{ marginTop: '8px' }}>
+              <summary style={{ cursor: 'pointer', outline: 'none', userSelect: 'none', fontSize: '11px', fontWeight: 600, opacity: 0.8 }}>
+                🔍 View Full Console Output
+              </summary>
+              <div className="code-block" style={{ maxHeight: '200px', overflowY: 'auto', marginTop: '6px' }}>
+                {runResult.output || 'No output captured.'}
+              </div>
+            </details>
+          ) : (
+            <div className="code-block" style={{ maxHeight: '200px', overflowY: 'auto' }}>
+              Running test command...
+            </div>
+          )}
         </div>
       )}
     </div>
