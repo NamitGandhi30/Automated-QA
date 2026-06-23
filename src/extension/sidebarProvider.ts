@@ -99,13 +99,21 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       this.postMessage({ type: 'testsGenerated', data: {
         filePath: tests.filePath,
         sourceFilePath: tests.sourceFilePath,
+        language: tests.language,
         framework: tests.framework,
         workspaceRoot: tests.workspaceRoot,
-        testConfigPath: tests.testConfigPath,
         normal: tests.normal,
         edgeCase: tests.edgeCase,
         stress: tests.stress,
       }});
+    });
+
+    this.testArchitect.onTestRun((result) => {
+      this.postMessage({ type: 'testOutput', data: result });
+    });
+
+    this.testArchitect.onExplanation((explanation) => {
+      this.postMessage({ type: 'testExplanation', data: explanation });
     });
 
     this.visualQAEngine.onResultReady((result) => {
@@ -127,6 +135,26 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     // Check if an Ollama API key is already stored and tell the UI
     this.secretManager.hasOllamaApiKey().then(hasKey => {
       this.postMessage({ type: 'ollamaKeyStatus', data: { hasKey } });
+    });
+
+    // Send codebase graph initial state
+    this.workspaceIndexer.getContext().then(ctx => {
+      this.workspaceIndexer.buildCodebaseGraph(ctx).then(graph => {
+        this.postMessage({ type: 'codebaseGraph', data: graph });
+      });
+    }).catch(() => {});
+
+    // Listen for text editor changes to auto-update graph
+    vscode.window.onDidChangeActiveTextEditor(async () => {
+      if (this._view?.visible) {
+        try {
+          const ctx = await this.workspaceIndexer.getContext();
+          const graph = await this.workspaceIndexer.buildCodebaseGraph(ctx);
+          this.postMessage({ type: 'codebaseGraph', data: graph });
+        } catch {
+          // ignore
+        }
+      }
     });
   }
 
@@ -217,6 +245,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           });
           const output = await this.testArchitect.runTests(pending.filePath);
           this.postMessage({ type: 'testOutput', data: output });
+          // Refresh the plain-language report for this re-run.
+          try {
+            const explanation = await this.testArchitect.explainLast();
+            if (explanation) {
+              this.postMessage({ type: 'testExplanation', data: explanation });
+            }
+          } catch { /* explanation is best-effort */ }
         } else {
           this.postMessage({
             type: 'testOutput',
@@ -232,6 +267,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
             },
           });
         }
+        break;
+      case 'saveTests':
+        await this.testArchitect.saveToProject();
         break;
       case 'runVisualCheck':
         await this.visualQAEngine.run(message.localUrl, message.productionUrl);
@@ -310,6 +348,52 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           percent: this.readinessTracker.getReadinessPercent(),
           files: this.readinessTracker.getAll(),
         }});
+        break;
+      case 'getCodebaseGraph':
+        try {
+          const ctx = await this.workspaceIndexer.getContext();
+          const graph = await this.workspaceIndexer.buildCodebaseGraph(ctx);
+          this.postMessage({ type: 'codebaseGraph', data: graph });
+        } catch (err: any) {
+          this.postMessage({ type: 'operationError', data: { command: 'getCodebaseGraph', message: err.message } });
+        }
+        break;
+      case 'installDependency':
+        if (this.dockerManager.isStackRunning) {
+          const pm = message.framework === 'pytest' ? 'pip3' : 'npm';
+          this.postMessage({
+            type: 'pipelineStatus',
+            data: { stage: 'installing', progress: 50, message: `Installing "${message.packageName}" inside sidecar container...` }
+          });
+          try {
+            const res = await this.dockerManager.postToSidecar<{ success: boolean; output: string; error?: string }>('/install-package', {
+              packageManager: pm,
+              packageName: message.packageName,
+              cwd: message.cwd || '',
+              workspaceRoot: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '',
+            });
+            if (res.success) {
+              this.postMessage({
+                type: 'pipelineStatus',
+                data: { stage: 'idle', progress: 100, message: `Successfully installed "${message.packageName}".` }
+              });
+              // Refresh graph
+              const ctx = await this.workspaceIndexer.getContext();
+              const graph = await this.workspaceIndexer.buildCodebaseGraph(ctx);
+              this.postMessage({ type: 'codebaseGraph', data: graph });
+            } else {
+              throw new Error(res.error || res.output || 'Installation failed inside container.');
+            }
+          } catch (err: any) {
+            this.postMessage({
+              type: 'pipelineStatus',
+              data: { stage: 'idle', progress: 0, message: `Failed to install "${message.packageName}": ${err.message}` }
+            });
+            vscode.window.showErrorMessage(`Automated QA: Failed to install "${message.packageName}" inside container: ${err.message}`);
+          }
+        } else {
+          vscode.window.showWarningMessage('Docker stack is not running. Please start the Docker stack first.');
+        }
         break;
     }
   }

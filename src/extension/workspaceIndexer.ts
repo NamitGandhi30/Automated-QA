@@ -1,7 +1,30 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { readTsconfigPaths } from './codeIntelligence';
+import { readTsconfigPaths, analyzeSourceFile } from './codeIntelligence';
+
+export interface GraphNode {
+  id: string; // relative file path or package name
+  label: string; // display name
+  type: 'main' | 'file' | 'lib';
+  language?: string;
+  isMain: boolean;
+  imports: string[];
+  missingDeps: string[];
+}
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+  type: 'import' | 'dependency';
+}
+
+export interface CodebaseGraph {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  mainFiles: string[];
+  externalLibs: string[];
+}
 
 export interface WorkspaceContext {
   testFramework: 'jest' | 'vitest' | 'pytest' | 'unknown';
@@ -235,7 +258,8 @@ export class WorkspaceIndexer {
         if (!fs.existsSync(td)) { continue; }
         try {
           const files = fs.readdirSync(td).filter(f =>
-            /\.(test|spec)\.(ts|tsx|js|jsx)$/.test(f) && !f.endsWith('.qa.test.ts')
+            (/\.(test|spec)\.(ts|tsx|js|jsx)$/.test(f) || /^(test_.*|.*_test)\.py$/.test(f)) &&
+            !f.includes('.qa.test.') && !f.includes('_qa.')
           );
           for (const f of files.slice(0, 2)) {
             nearbyTestFiles.push({
@@ -357,5 +381,170 @@ export class WorkspaceIndexer {
     } catch {
       return false;
     }
+  }
+
+  async buildCodebaseGraph(context: WorkspaceContext): Promise<CodebaseGraph> {
+    const nodes: GraphNode[] = [];
+    const edges: GraphEdge[] = [];
+    const mainFilesSet = new Set<string>();
+    const externalLibsSet = new Set<string>();
+    const fileToNodeMap = new Map<string, GraphNode>();
+
+    const isMainFile = (relPath: string) => {
+      const base = path.basename(relPath).toLowerCase();
+      return ['index.ts', 'index.js', 'server.ts', 'server.js', 'app.ts', 'app.js', 'main.py', 'manage.py', 'main.ts', 'main.js'].includes(base);
+    };
+
+    const resolveInternalImport = (sourceRelPath: string, importModule: string, fileTree: string[]): string | null => {
+      const sourceDir = path.dirname(sourceRelPath);
+      const absDir = path.join(context.workspaceRoot, sourceDir);
+      
+      const potentialExtensions = ['.ts', '.tsx', '.js', '.jsx', '.py'];
+      for (const ext of ['', ...potentialExtensions]) {
+        let trial = importModule;
+        if (ext) {
+          trial = importModule + ext;
+        }
+        const trialAbs = path.resolve(absDir, trial);
+        const trialRel = path.relative(context.workspaceRoot, trialAbs).replace(/\\/g, '/');
+        if (fileTree.includes(trialRel)) {
+          return trialRel;
+        }
+        const indexAbs = path.resolve(absDir, importModule, 'index' + ext);
+        const indexRel = path.relative(context.workspaceRoot, indexAbs).replace(/\\/g, '/');
+        if (fileTree.includes(indexRel)) {
+          return indexRel;
+        }
+      }
+      return null;
+    };
+
+    const pythonStdLibs = new Set([
+      'os', 'sys', 'json', 'typing', 'datetime', 'time', 'math', 're', 'collections', 'itertools', 'functools',
+      'shutil', 'tempfile', 'hashlib', 'uuid', 'logging', 'pathlib', 'random', 'importlib', 'abc', 'unittest',
+      'asyncio', 'contextlib', 'argparse', 'urllib', 'http', 'socket', 'threading', 'subprocess', 'select'
+    ]);
+
+    for (const relPath of context.fileTree) {
+      const absPath = path.join(context.workspaceRoot, relPath);
+      if (!fs.existsSync(absPath)) continue;
+
+      let content = '';
+      try {
+        content = fs.readFileSync(absPath, 'utf-8');
+      } catch {
+        continue;
+      }
+
+      const isPython = relPath.endsWith('.py');
+      const lang = isPython ? 'python' : (relPath.endsWith('.ts') || relPath.endsWith('.tsx') ? 'typescript' : 'javascript');
+      const isMain = isMainFile(relPath);
+      if (isMain) {
+        mainFilesSet.add(relPath);
+      }
+
+      const codeIntel = analyzeSourceFile(
+        absPath,
+        content,
+        context.workspaceRoot,
+        context.dependencies,
+        context.devDependencies
+      );
+
+      const importsList: string[] = [];
+      const missingDepsList: string[] = [];
+
+      for (const extImp of codeIntel.externalImports) {
+        let pkgName = extImp.module.split('/')[0];
+        
+        if (isPython) {
+          if (pythonStdLibs.has(pkgName)) {
+            continue;
+          }
+          const pipNameMap: Record<string, string> = {
+            'dateutil': 'python-dateutil',
+            'yaml': 'pyyaml',
+            'dotenv': 'python-dotenv',
+            'PIL': 'Pillow',
+            'bs4': 'beautifulsoup4',
+            'jwt': 'pyjwt',
+            'jose': 'python-jose',
+            'websocket': 'websocket-client',
+            'github': 'pygithub'
+          };
+          if (pipNameMap[pkgName]) {
+            pkgName = pipNameMap[pkgName];
+          }
+          const allDeps = { ...context.dependencies, ...context.devDependencies };
+          const hasDep = allDeps[pkgName] !== undefined;
+          importsList.push(pkgName);
+          externalLibsSet.add(pkgName);
+          if (!hasDep && pkgName !== 'pytest') {
+            missingDepsList.push(pkgName);
+          }
+        } else {
+          const allDeps = { ...context.dependencies, ...context.devDependencies };
+          const hasDep = allDeps[pkgName] !== undefined;
+          importsList.push(pkgName);
+          externalLibsSet.add(pkgName);
+          if (!hasDep) {
+            missingDepsList.push(pkgName);
+          }
+        }
+      }
+
+      for (const intImp of codeIntel.internalImports) {
+        const resolvedRelPath = resolveInternalImport(relPath, intImp.module, context.fileTree);
+        if (resolvedRelPath) {
+          edges.push({
+            source: relPath.replace(/\\/g, '/'),
+            target: resolvedRelPath.replace(/\\/g, '/'),
+            type: 'import'
+          });
+        }
+      }
+
+      const node: GraphNode = {
+        id: relPath.replace(/\\/g, '/'),
+        label: path.basename(relPath),
+        type: isMain ? 'main' : 'file',
+        language: lang,
+        isMain,
+        imports: importsList,
+        missingDeps: missingDepsList
+      };
+
+      nodes.push(node);
+      fileToNodeMap.set(node.id, node);
+    }
+
+    for (const lib of externalLibsSet) {
+      for (const node of nodes) {
+        if (node.imports.includes(lib)) {
+          edges.push({
+            source: node.id,
+            target: lib,
+            type: 'dependency'
+          });
+        }
+      }
+
+      const isMissing = nodes.some(n => n.missingDeps.includes(lib));
+      nodes.push({
+        id: lib,
+        label: lib,
+        type: 'lib',
+        isMain: false,
+        imports: [],
+        missingDeps: isMissing ? [lib] : []
+      });
+    }
+
+    return {
+      nodes,
+      edges,
+      mainFiles: Array.from(mainFilesSet).map(f => f.replace(/\\/g, '/')),
+      externalLibs: Array.from(externalLibsSet)
+    };
   }
 }

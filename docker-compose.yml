@@ -10,7 +10,9 @@ services:
     volumes:
       - "${WORKSPACE_ROOT:-.}:/app/workspace"
     networks:
+      # aq-bridge: outbound internet (AI provider calls). aq-internal: reach the test-runner.
       - aq-bridge
+      - aq-internal
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4777/health"]
@@ -31,12 +33,20 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1.5'
-          memory: 1024M
+          # Compiled-language toolchains (Rust/C++/Java) are memory-hungry when
+          # compiling test binaries, so give the universal runner more headroom.
+          cpus: '2.0'
+          memory: 3072M
     networks:
-      - aq-bridge
+      # ONLY the internal network — no internet. This guarantees hermetic test
+      # runs: any unmocked external API/HTTP call fails fast instead of hanging,
+      # so tests must fully mock their dependencies. The sidecar reaches it here.
+      - aq-internal
     restart: unless-stopped
 
 networks:
   aq-bridge:
     driver: bridge
+  aq-internal:
+    driver: bridge
+    internal: true

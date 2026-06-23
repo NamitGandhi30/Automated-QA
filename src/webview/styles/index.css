@@ -342,3 +342,30 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--vscode-scrollbarSlider-hoverBackground);
 }
+
+/* Codebase Graph / Map Styles */
+@keyframes graphDash {
+  to {
+    stroke-dashoffset: -20;
+  }
+}
+
+svg line {
+  transition: stroke 0.3s, stroke-width 0.3s, opacity 0.3s;
+}
+
+svg line[stroke-dasharray] {
+  animation: graphDash 1s linear infinite;
+}
+
+svg g {
+  transition: opacity 0.3s;
+}
+
+svg rect {
+  transition: fill 0.3s, stroke 0.3s, stroke-width 0.2s;
+}
+
+svg text {
+  transition: fill 0.3s;
+}

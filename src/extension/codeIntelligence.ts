@@ -332,7 +332,7 @@ function findExistingTestPattern(sourceFilePath: string, workspaceRoot: string):
     try {
       const files = fs.readdirSync(testDir);
       for (const f of files) {
-        if (testPatterns.some(p => p.test(f)) && !f.endsWith('.qa.test.ts') && !f.endsWith('.qa.test.js')) {
+        if (testPatterns.some(p => p.test(f)) && !f.includes('.qa.test.') && !f.includes('_qa.')) {
           testFile = path.join(testDir, f);
           break;
         }
@@ -413,7 +413,7 @@ function findFirstTestFileRecursive(dir: string, maxDepth: number): string {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     // Check files first
     for (const entry of entries) {
-      if (entry.isFile() && /\.(test|spec)\.\w+$/.test(entry.name) && !entry.name.endsWith('.qa.test.ts')) {
+      if (entry.isFile() && /\.(test|spec)\.\w+$/.test(entry.name) && !entry.name.includes('.qa.test.') && !entry.name.includes('_qa.')) {
         return path.join(dir, entry.name);
       }
     }
@@ -510,7 +510,8 @@ function buildMockSetup(
     const mockEntries: string[] = [];
     for (const name of imp.names) {
       // Check if it's used as a function call in the source
-      const isCalled = new RegExp(`\\b${name}\\s*\\(`).test(content);
+      const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const isCalled = new RegExp(`\\b${escapedName}\\s*\\(`).test(content);
       if (isCalled) {
         mockEntries.push(`  ${name}: ${fnFactory},`);
       } else {

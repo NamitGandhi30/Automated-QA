@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { aiComplete } from './aiProxy';
 import { runVisualCheck } from './visualCheck';
-import { runTests, installPackage } from './testRunner';
+import { runTests, installPackage, runTestsSandbox } from './testRunner';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '4777', 10);
@@ -74,6 +74,29 @@ app.post('/run-tests', async (req, res) => {
     res.json(result);
   } catch (err: any) {
     console.error('Test runner error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Hermetic, multi-language sandbox test run (ephemeral — never touches the repo)
+app.post('/run-sandbox', async (req, res) => {
+  try {
+    const { id, language, sourceFileName, sourceContent, siblingFiles, testFileName, testContent } = req.body;
+    if (!id || !language || !sourceFileName || !testFileName || testContent == null) {
+      return res.status(400).json({ error: 'Missing required sandbox fields (id, language, sourceFileName, testFileName, testContent)' });
+    }
+    const result = await runTestsSandbox({
+      id,
+      language,
+      sourceFileName,
+      sourceContent: sourceContent || '',
+      siblingFiles: siblingFiles || [],
+      testFileName,
+      testContent,
+    });
+    res.json(result);
+  } catch (err: any) {
+    console.error('Sandbox test run error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });

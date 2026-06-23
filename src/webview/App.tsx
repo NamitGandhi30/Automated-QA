@@ -5,6 +5,7 @@ import TestPanel from './components/TestPanel';
 import VisualQAPanel from './components/VisualQAPanel';
 import PRAutomatorPanel from './components/PRAutomator';
 import SettingsPanel from './components/SettingsPanel';
+import CodebaseGraphPanel from './components/CodebaseGraphPanel';
 
 declare function acquireVsCodeApi(): {
   postMessage(msg: any): void;
@@ -14,7 +15,7 @@ declare function acquireVsCodeApi(): {
 
 const vscode = acquireVsCodeApi();
 
-type Tab = 'dashboard' | 'reviewer' | 'tests' | 'visual' | 'automator' | 'settings';
+type Tab = 'dashboard' | 'graph' | 'reviewer' | 'tests' | 'visual' | 'automator' | 'settings';
 
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<Tab>('dashboard');
@@ -27,9 +28,11 @@ const App: React.FC = () => {
   const [reviewStatus, setReviewStatus] = useState<any>(null);
   const [tests, setTests] = useState<any>(null);
   const [testOutput, setTestOutput] = useState<any>(null);
+  const [testExplanation, setTestExplanation] = useState<any>(null);
   const [visualResult, setVisualResult] = useState<any>(null);
   const [pipelineStatus, setPipelineStatus] = useState<any>({ stage: 'idle', progress: 0, message: 'Ready' });
   const [connectionResult, setConnectionResult] = useState<any>(null);
+  const [codebaseGraph, setCodebaseGraph] = useState<any>(null);
 
   useEffect(() => {
     const handler = (event: MessageEvent) => {
@@ -59,9 +62,13 @@ const App: React.FC = () => {
         case 'testsGenerated':
           setTests(msg.data);
           setTestOutput(null);
+          setTestExplanation(null);
           break;
         case 'testOutput':
           setTestOutput(msg.data);
+          break;
+        case 'testExplanation':
+          setTestExplanation(msg.data);
           break;
         case 'operationError':
           setTestOutput({
@@ -84,6 +91,9 @@ const App: React.FC = () => {
         case 'connectionResult':
           setConnectionResult(msg.data);
           break;
+        case 'codebaseGraph':
+          setCodebaseGraph(msg.data);
+          break;
       }
     };
 
@@ -94,7 +104,8 @@ const App: React.FC = () => {
   const postMessage = useCallback((msg: any) => vscode.postMessage(msg), []);
 
   const tabs: { id: Tab; label: string; icon: string }[] = [
-    { id: 'dashboard', label: 'Dashboard', icon: '📊' },
+    { id: 'dashboard', label: 'Dashboard', icon: '🏠' },
+    { id: 'graph', label: 'Codebase Map', icon: '🗺️' },
     { id: 'reviewer', label: 'Reviewer', icon: '🔍' },
     { id: 'tests', label: 'Tests', icon: '🧪' },
     { id: 'visual', label: 'Visual QA', icon: '🖼️' },
@@ -134,11 +145,14 @@ const App: React.FC = () => {
           postMessage={postMessage}
         />
       )}
+      {activeTab === 'graph' && (
+        <CodebaseGraphPanel graph={codebaseGraph} postMessage={postMessage} />
+      )}
       {activeTab === 'reviewer' && (
         <ReviewPanel findings={findings} reviewStatus={reviewStatus} postMessage={postMessage} />
       )}
       {activeTab === 'tests' && (
-        <TestPanel tests={tests} testOutput={testOutput} postMessage={postMessage} />
+        <TestPanel tests={tests} testOutput={testOutput} explanation={testExplanation} postMessage={postMessage} />
       )}
       {activeTab === 'visual' && (
         <VisualQAPanel result={visualResult} postMessage={postMessage} dockerStatus={dockerStatus} />

@@ -26,7 +26,10 @@ export async function activate(context: vscode.ExtensionContext) {
   // Engine services
   const semanticReviewer = new SemanticReviewer(secretManager, workspaceIndexer, dockerManager, outputChannel);
   const codeLensProvider = new CodeLensReviewProvider(semanticReviewer);
-  const testArchitect = new TestArchitect(secretManager, workspaceIndexer, dockerManager, outputChannel);
+  const testArchitect = new TestArchitect(
+    secretManager, workspaceIndexer, dockerManager, outputChannel,
+    context.globalStorageUri, context.globalState
+  );
   const visualQAEngine = new VisualQAEngine(dockerManager, outputChannel);
   const prAutomator = new PRAutomator(
     semanticReviewer,

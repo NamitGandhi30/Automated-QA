@@ -150,7 +150,7 @@ export async function runTests(
       cmd = `vitest run ${relativeTestPath}${configArg} --reporter=verbose --pool=forks --testTimeout=10000 --passWithNoTests 2>&1`;
     }
   } else if (framework === 'pytest') {
-    cmd = `python -m pytest ${relativeTestPath} -v 2>&1`;
+    cmd = `python3 -m pytest ${relativeTestPath} -v 2>&1`;
   }
 
   if (!cmd) {
@@ -231,6 +231,187 @@ export async function runTests(
   }
 }
 
+// ─── Hermetic, multi-language sandbox runner ───────────────────────────────
+// Runs a generated test in an ephemeral /app/sandbox/<id> dir using the
+// globally-installed toolchains baked into the test-runner image. Nothing is
+// written to the user's workspace and the sandbox is deleted after every run.
+
+export interface SandboxFile {
+  name: string;
+  content: string;
+}
+
+export interface RunSandboxPayload {
+  id: string;
+  language: string; // typescript | javascript | python | go | rust | java | c | cpp
+  sourceFileName: string;
+  sourceContent: string;
+  siblingFiles?: SandboxFile[];
+  testFileName: string;
+  testContent: string;
+}
+
+const SANDBOX_ROOT = '/app/sandbox';
+
+function q(value: string): string {
+  return `"${value.replace(/"/g, '\\"')}"`;
+}
+
+function frameworkForLanguage(language: string): string {
+  switch (language) {
+    case 'typescript':
+    case 'javascript': return 'jest';
+    case 'python': return 'pytest';
+    case 'go': return 'go';
+    case 'rust': return 'rust';
+    case 'java': return 'junit';
+    case 'c': return 'utest';
+    case 'cpp': return 'doctest';
+    default: return 'jest';
+  }
+}
+
+interface SandboxPlan {
+  files: { path: string; content: string }[];
+  command: string;
+  cwd: string;
+  cleanupDir: string;
+  framework: string;
+}
+
+function buildSandboxPlan(payload: RunSandboxPayload): SandboxPlan {
+  const { id, language, sourceFileName, sourceContent, testFileName, testContent } = payload;
+  const dir = `${SANDBOX_ROOT}/${id}`;
+  const siblings = payload.siblingFiles || [];
+  const framework = frameworkForLanguage(language);
+
+  const files: { path: string; content: string }[] = [];
+  const add = (name: string, content: string) => files.push({ path: `${dir}/${name}`, content });
+  for (const s of siblings) {
+    if (s && s.name && s.name !== sourceFileName && s.name !== testFileName) { add(s.name, s.content); }
+  }
+
+  let command = '';
+
+  if (language === 'typescript' || language === 'javascript') {
+    const jestConfig = {
+      rootDir: '.',
+      testEnvironment: 'node',
+      modulePaths: ['/usr/local/lib/node_modules'],
+      transform: {
+        '^.+\\.[cm]?[jt]sx?$': ['ts-jest', {
+          isolatedModules: true,
+          tsconfig: { allowJs: true, esModuleInterop: true, module: 'commonjs', target: 'es2020', jsx: 'react-jsx' },
+        }],
+      },
+    };
+    add(sourceFileName, sourceContent);
+    add(testFileName, testContent);
+    add('jest.config.json', JSON.stringify(jestConfig, null, 2));
+    add('package.json', JSON.stringify({ name: 'qa-sandbox', private: true, version: '0.0.0' }, null, 2));
+    // --forceExit: don't hang the run if a test leaves a timer/socket open.
+    // --maxWorkers=1: deterministic + low memory inside the resource-limited container.
+    command = `jest --config jest.config.json --runTestsByPath ${q(testFileName)} --verbose --passWithNoTests --forceExit --maxWorkers=1`;
+  } else if (language === 'python') {
+    add(sourceFileName, sourceContent);
+    add(testFileName, testContent);
+    command = `python3 -m pytest ${q(testFileName)} -v`;
+  } else if (language === 'go') {
+    add('go.mod', 'module qasandbox\n\ngo 1.19\n');
+    add(sourceFileName, sourceContent);
+    add(testFileName, testContent); // must end with _test.go
+    command = `go test . -v -count=1`;
+  } else if (language === 'rust') {
+    // Single-crate: source + AI-generated `#[cfg(test)] mod tests` block.
+    add('qa_main.rs', `${sourceContent}\n\n${testContent}\n`);
+    command = `rustc --test qa_main.rs -o qa_testbin && ./qa_testbin`;
+  } else if (language === 'java') {
+    add(sourceFileName, sourceContent);
+    add(testFileName, testContent);
+    command =
+      `javac -cp "$JUNIT_JAR" -d out *.java && ` +
+      `java -jar "$JUNIT_JAR" -cp out --scan-class-path --details=tree --disable-banner --fail-if-no-tests`;
+  } else if (language === 'c') {
+    add(sourceFileName, sourceContent);
+    add(testFileName, testContent); // test #include's the source + utest.h
+    command = `gcc -I"$QA_HEADERS" ${q(testFileName)} -o qa_testbin && ./qa_testbin`;
+  } else if (language === 'cpp') {
+    add(sourceFileName, sourceContent);
+    add(testFileName, testContent); // test #include's the source + doctest.h
+    command = `g++ -std=c++17 -I"$QA_HEADERS" ${q(testFileName)} -o qa_testbin && ./qa_testbin`;
+  } else {
+    // Fallback: treat as jest TS/JS
+    add(sourceFileName, sourceContent);
+    add(testFileName, testContent);
+    command = `jest --runTestsByPath ${q(testFileName)} --verbose --passWithNoTests`;
+  }
+
+  return { files, command, cwd: dir, cleanupDir: dir, framework };
+}
+
+export async function runTestsSandbox(payload: RunSandboxPayload): Promise<{
+  status: 'passed' | 'failed' | 'skipped' | 'error';
+  command: string;
+  cwd: string;
+  exitCode: number | null;
+  output: string;
+  framework: string;
+  testFilePath: string;
+  failureReason?: string;
+  failureSummary?: string;
+}> {
+  const plan = buildSandboxPlan(payload);
+  console.log(`[sandbox] lang=${payload.language} framework=${plan.framework} id=${payload.id}`);
+
+  try {
+    const runResult = await postRequest(`${TEST_RUNNER_URL}/run-tests`, {
+      command: plan.command,
+      cwd: plan.cwd,
+      files: plan.files,
+      cleanupDir: plan.cleanupDir,
+    });
+
+    const output = stripAnsi((runResult.stdout + (runResult.stderr ? `\n${runResult.stderr}` : '')).trim());
+    const exitCode = runResult.exitCode;
+
+    if (exitCode === 0) {
+      return {
+        status: 'passed',
+        command: plan.command,
+        cwd: plan.cwd,
+        exitCode: 0,
+        output,
+        framework: plan.framework,
+        testFilePath: payload.testFileName,
+      };
+    }
+
+    return {
+      status: 'failed',
+      command: plan.command,
+      cwd: plan.cwd,
+      exitCode,
+      output,
+      framework: plan.framework,
+      testFilePath: payload.testFileName,
+      failureReason: describeFailure(plan.framework, exitCode, output, '', plan.cwd, payload.testFileName),
+      failureSummary: summarizeTestOutput(plan.framework, output),
+    };
+  } catch (err: any) {
+    const errMsg = err.message || 'Sidecar failed to reach the test-runner container.';
+    return {
+      status: 'error',
+      command: plan.command,
+      cwd: plan.cwd,
+      exitCode: null,
+      output: errMsg,
+      framework: plan.framework,
+      testFilePath: payload.testFileName,
+      failureReason: `Test runner communication failed: ${errMsg}`,
+    };
+  }
+}
+
 function postRequest(urlStr: string, body: any): Promise<{ exitCode: number; stdout: string; stderr: string; error?: string }> {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
@@ -246,7 +427,7 @@ function postRequest(urlStr: string, body: any): Promise<{ exitCode: number; std
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(data),
         },
-        timeout: 130000,
+        timeout: 150000,
       },
       (res) => {
         let responseData = '';
@@ -308,8 +489,11 @@ function describeFailure(framework: string, exitCode: number, output: string, te
   ) {
     return `${framework} is not available in this workspace. Make sure it is installed, then run again.`;
   }
-  if (/timeout/i.test(output)) {
-    return 'The test command timed out after 180 seconds. This usually means a generated test has a hanging promise or infinite loop. Check the test file for unresolved promises.';
+  if (/exceeded the 120s limit|\[runner\] The test process exceeded/i.test(output)) {
+    return 'The test run exceeded the 120s limit and was stopped. Most likely a stress-tier test does too much work, a loop never ends, or a promise never resolves. The suite will be regenerated to be faster/deterministic.';
+  }
+  if (/exceeded timeout of \d+ ?ms|timed out in \d+ ?ms|test timed out/i.test(output)) {
+    return 'A single test exceeded its per-test time limit — usually an unresolved promise or a too-heavy stress loop. The failing test will be tightened on the next attempt.';
   }
   // Assertion failures — tests ran but some failed. This is normal test behavior, not a pipeline bug.
   if (/FAIL|✕|✗|×|failed/i.test(output)) {
@@ -496,6 +680,10 @@ export async function installPackage(
     cmd = 'pip3 install --break-system-packages pytest';
   } else {
     switch (packageManager) {
+      case 'pip':
+      case 'pip3':
+        cmd = `pip3 install --break-system-packages ${packageName}`;
+        break;
       case 'yarn':
         cmd = `yarn add ${packageName}`;
         break;
